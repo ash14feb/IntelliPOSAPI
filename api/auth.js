@@ -808,7 +808,7 @@ router.post('/forgot-password', async (req, res) => {
             [user.user_id, resetToken, expiresAt]
         );
 
-        const resetUrl = `${process.env.FRONTEND_URL || 'https://intelli-billing.vercel.app'}/reset-password?token=${resetToken}`;
+        const resetUrl = `${process.env.FRONTEND_URL || 'https://intelli-posui.vercel.app'}/reset-password?token=${resetToken}`;
 
         await sendPasswordResetEmail({
             name: user.full_name,
