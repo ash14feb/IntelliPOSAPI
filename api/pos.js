@@ -6,7 +6,7 @@ const router = express.Router();
 router.use(authMiddleware);
 
 const DEFAULT_SETTINGS = {
-    restaurantName: 'SCANNEX ULTRA POS',
+    restaurantName: 'Intelli Billing Software',
     currencySymbol: 'Rs.',
     cgstPercent: 2.5,
     sgstPercent: 2.5,
@@ -14,8 +14,9 @@ const DEFAULT_SETTINGS = {
     enableKot: true,
     printerConnectionType: 'bluetooth',
     paperWidth: '3inch',
-    receiptHeader: 'Welcome to Scannex!',
-    receiptFooter: 'Thank you for visiting!'
+    receiptHeader: 'Welcome to Intelli Billing!',
+    receiptFooter: 'Thank you for visiting!',
+    orderAfterBill: false
 };
 
 const mapSettingsRow = (row) => ({
@@ -28,7 +29,8 @@ const mapSettingsRow = (row) => ({
     printerConnectionType: row?.printer_connection_type ?? DEFAULT_SETTINGS.printerConnectionType,
     paperWidth: row?.paper_width ?? DEFAULT_SETTINGS.paperWidth,
     receiptHeader: row?.receipt_header ?? DEFAULT_SETTINGS.receiptHeader,
-    receiptFooter: row?.receipt_footer ?? DEFAULT_SETTINGS.receiptFooter
+    receiptFooter: row?.receipt_footer ?? DEFAULT_SETTINGS.receiptFooter,
+    orderAfterBill: Boolean(row?.order_after_bill ?? DEFAULT_SETTINGS.orderAfterBill)
 });
 
 const mapMenuItem = (row) => ({
@@ -41,7 +43,7 @@ const mapMenuItem = (row) => ({
 
 async function getSettings(tenantId) {
     const rows = await db.query(
-        `SELECT restaurant_name, currency_symbol, cgst_percent, sgst_percent, tax_inclusive, enable_kot, printer_connection_type, paper_width, receipt_header, receipt_footer
+        `SELECT restaurant_name, currency_symbol, cgst_percent, sgst_percent, tax_inclusive, enable_kot, printer_connection_type, paper_width, receipt_header, receipt_footer, order_after_bill
          FROM pos_settings
          WHERE tenant_id = ?
          LIMIT 1`,
@@ -196,7 +198,8 @@ router.put('/settings', async (req, res) => {
             printerConnectionType,
             paperWidth,
             receiptHeader,
-            receiptFooter
+            receiptFooter,
+            orderAfterBill
         } = req.body;
 
         await db.query(
@@ -211,8 +214,9 @@ router.put('/settings', async (req, res) => {
                 printer_connection_type,
                 paper_width,
                 receipt_header,
-                receipt_footer
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                receipt_footer,
+                order_after_bill
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON DUPLICATE KEY UPDATE
                 restaurant_name = VALUES(restaurant_name),
                 currency_symbol = VALUES(currency_symbol),
@@ -223,7 +227,8 @@ router.put('/settings', async (req, res) => {
                 printer_connection_type = VALUES(printer_connection_type),
                 paper_width = VALUES(paper_width),
                 receipt_header = VALUES(receipt_header),
-                receipt_footer = VALUES(receipt_footer)`,
+                receipt_footer = VALUES(receipt_footer),
+                order_after_bill = VALUES(order_after_bill)`,
             [
                 tenantId,
                 restaurantName,
@@ -235,7 +240,8 @@ router.put('/settings', async (req, res) => {
                 printerConnectionType === 'usb' ? 'usb' : 'bluetooth',
                 paperWidth === '2inch' ? '2inch' : '3inch',
                 receiptHeader,
-                receiptFooter
+                receiptFooter,
+                orderAfterBill ? 1 : 0
             ]
         );
 
