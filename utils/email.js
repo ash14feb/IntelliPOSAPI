@@ -53,7 +53,7 @@ async function sendCredentialsEmail({
     return response.json();
 }
 
-async function sendPasswordResetEmail({ name, email, resetUrl }) {
+async function sendPasswordResetEmail({ name, email, username, resetUrl }) {
     const response = await fetch('https://api.brevo.com/v3/smtp/email', {
         method: 'POST',
         headers: {
@@ -77,7 +77,8 @@ async function sendPasswordResetEmail({ name, email, resetUrl }) {
                 <html>
                     <body>
                         <p>Hello ${name},</p>
-                        <p>We received a request to reset your password for your Intelli Billing account.</p>
+                        <p>We received a request to reset the password for your Intelli Billing account.</p>
+                        <p><strong>Username:</strong> ${username}</p>
                         <p>Click the link below to set a new password. This link is valid for 1 hour.</p>
                         <p><a href="${resetUrl}" style="display:inline-block;padding:12px 24px;background-color:#2563EB;color:#ffffff;text-decoration:none;border-radius:8px;font-weight:bold;">Reset Password</a></p>
                         <p style="margin-top:16px;color:#666;font-size:13px;">If the button doesn't work, copy and paste this link into your browser:</p>

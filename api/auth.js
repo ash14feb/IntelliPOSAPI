@@ -779,7 +779,7 @@ router.post('/forgot-password', async (req, res) => {
         }
 
         const users = await db.query(
-            'SELECT user_id, full_name, email FROM users WHERE email = ? AND is_active = 1',
+            'SELECT user_id, full_name, email, username FROM users WHERE email = ? AND is_active = 1',
             [email]
         );
 
@@ -813,6 +813,7 @@ router.post('/forgot-password', async (req, res) => {
         await sendPasswordResetEmail({
             name: user.full_name,
             email: user.email,
+            username: user.username,
             resetUrl
         });
 
