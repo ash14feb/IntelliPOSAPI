@@ -4,7 +4,7 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const db = require('../utils/database');
 const { authMiddleware, authorize } = require('../middleware/auth');
-const { sendCredentialsEmail } = require('../utils/email');
+const { sendCredentialsEmail, sendPasswordResetEmail } = require('../utils/email');
 
 const router = express.Router();
 const JWT_SECRET = process.env.JWT_SECRET || 'dxMysore';
@@ -763,6 +763,135 @@ router.post('/super-admin/stores/:tenantId/resend-admin-credentials', authMiddle
         res.status(500).json({
             success: false,
             message: 'Error resending admin credentials'
+        });
+    }
+});
+
+router.post('/forgot-password', async (req, res) => {
+    try {
+        const { email } = req.body;
+
+        if (!email) {
+            return res.status(400).json({
+                success: false,
+                message: 'Email is required'
+            });
+        }
+
+        const users = await db.query(
+            'SELECT user_id, full_name, email FROM users WHERE email = ? AND is_active = 1',
+            [email]
+        );
+
+        // Always return success to prevent email enumeration
+        if (!users || users.length === 0) {
+            return res.json({
+                success: true,
+                message: 'If an account with that email exists, a reset link has been sent.'
+            });
+        }
+
+        const user = users[0];
+
+        // Invalidate any existing unused tokens for this user
+        await db.query(
+            'UPDATE password_reset_tokens SET used = 1 WHERE user_id = ? AND used = 0',
+            [user.user_id]
+        );
+
+        // Generate a secure token
+        const resetToken = crypto.randomBytes(32).toString('hex');
+        const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+
+        await db.query(
+            'INSERT INTO password_reset_tokens (user_id, token, expires_at) VALUES (?, ?, ?)',
+            [user.user_id, resetToken, expiresAt]
+        );
+
+        const resetUrl = `${process.env.FRONTEND_URL || 'https://intelli-billing.vercel.app'}/reset-password?token=${resetToken}`;
+
+        await sendPasswordResetEmail({
+            name: user.full_name,
+            email: user.email,
+            resetUrl
+        });
+
+        res.json({
+            success: true,
+            message: 'If an account with that email exists, a reset link has been sent.'
+        });
+    } catch (error) {
+        console.error('Forgot password error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Server error'
+        });
+    }
+});
+
+router.post('/reset-password', async (req, res) => {
+    try {
+        const { token, newPassword } = req.body;
+
+        if (!token || !newPassword) {
+            return res.status(400).json({
+                success: false,
+                message: 'Token and new password are required'
+            });
+        }
+
+        if (newPassword.length < 6) {
+            return res.status(400).json({
+                success: false,
+                message: 'New password must be at least 6 characters long'
+            });
+        }
+
+        const tokens = await db.query(
+            'SELECT * FROM password_reset_tokens WHERE token = ? AND used = 0',
+            [token]
+        );
+
+        if (!tokens || tokens.length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid or expired reset token'
+            });
+        }
+
+        const resetRecord = tokens[0];
+
+        // Check expiry
+        if (new Date(resetRecord.expires_at) < new Date()) {
+            return res.status(400).json({
+                success: false,
+                message: 'Reset token has expired. Please request a new one.'
+            });
+        }
+
+        // Hash new password and update
+        const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+        await db.query(
+            'UPDATE users SET password_hash = ? WHERE user_id = ?',
+            [hashedPassword, resetRecord.user_id]
+        );
+
+        // Mark token as used
+        await db.query(
+            'UPDATE password_reset_tokens SET used = 1 WHERE id = ?',
+            [resetRecord.id]
+        );
+
+        res.json({
+            success: true,
+            message: 'Password has been reset successfully. You can now login with your new password.'
+        });
+    } catch (error) {
+        console.error('Reset password error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Server error'
         });
     }
 });

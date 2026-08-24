@@ -53,4 +53,48 @@ async function sendCredentialsEmail({
     return response.json();
 }
 
-module.exports = { sendCredentialsEmail };
+async function sendPasswordResetEmail({ name, email, resetUrl }) {
+    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST',
+        headers: {
+            accept: 'application/json',
+            'api-key': BREVO_API_KEY,
+            'content-type': 'application/json'
+        },
+        body: JSON.stringify({
+            sender: {
+                name: 'Intelli Billing',
+                email: 'scanex@scanexsystems.com'
+            },
+            to: [
+                {
+                    email,
+                    name
+                }
+            ],
+            subject: 'Password Reset Request - Intelli Billing',
+            htmlContent: `
+                <html>
+                    <body>
+                        <p>Hello ${name},</p>
+                        <p>We received a request to reset your password for your Intelli Billing account.</p>
+                        <p>Click the link below to set a new password. This link is valid for 1 hour.</p>
+                        <p><a href="${resetUrl}" style="display:inline-block;padding:12px 24px;background-color:#2563EB;color:#ffffff;text-decoration:none;border-radius:8px;font-weight:bold;">Reset Password</a></p>
+                        <p style="margin-top:16px;color:#666;font-size:13px;">If the button doesn't work, copy and paste this link into your browser:</p>
+                        <p style="word-break:break-all;color:#2563EB;font-size:13px;">${resetUrl}</p>
+                        <p style="margin-top:16px;color:#666;font-size:13px;">If you didn't request this, please ignore this email.</p>
+                    </body>
+                </html>
+            `
+        })
+    });
+
+    if (!response.ok) {
+        const errorPayload = await response.text();
+        throw new Error(`Brevo email send failed: ${errorPayload}`);
+    }
+
+    return response.json();
+}
+
+module.exports = { sendCredentialsEmail, sendPasswordResetEmail };

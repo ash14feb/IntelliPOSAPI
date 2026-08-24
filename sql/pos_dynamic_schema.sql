@@ -138,3 +138,17 @@ CREATE TABLE IF NOT EXISTS pos_order_items (
 --
 -- For existing single-tenant databases, backfill one tenant and update old rows with that tenant_id
 -- before applying the foreign keys and unique indexes above.
+
+CREATE TABLE IF NOT EXISTS password_reset_tokens (
+    id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    user_id INT UNSIGNED NOT NULL,
+    token VARCHAR(64) NOT NULL,
+    expires_at TIMESTAMP NOT NULL,
+    used TINYINT(1) NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY idx_prt_token (token),
+    KEY idx_prt_user_id (user_id),
+    CONSTRAINT fk_prt_user
+        FOREIGN KEY (user_id) REFERENCES users(user_id)
+        ON DELETE CASCADE
+);
