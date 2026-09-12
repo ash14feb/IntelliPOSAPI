@@ -16,7 +16,8 @@ const DEFAULT_SETTINGS = {
     paperWidth: '3inch',
     receiptHeader: 'Welcome to Intelli Billing!',
     receiptFooter: 'Thank you for visiting!',
-    orderAfterBill: false
+    orderAfterBill: false,
+    businessType: 'FOOD'
 };
 
 const mapSettingsRow = (row) => ({
@@ -30,7 +31,8 @@ const mapSettingsRow = (row) => ({
     paperWidth: row?.paper_width ?? DEFAULT_SETTINGS.paperWidth,
     receiptHeader: row?.receipt_header ?? DEFAULT_SETTINGS.receiptHeader,
     receiptFooter: row?.receipt_footer ?? DEFAULT_SETTINGS.receiptFooter,
-    orderAfterBill: Boolean(row?.order_after_bill ?? DEFAULT_SETTINGS.orderAfterBill)
+    orderAfterBill: Boolean(row?.order_after_bill ?? DEFAULT_SETTINGS.orderAfterBill),
+    businessType: row?.business_type ?? DEFAULT_SETTINGS.businessType
 });
 
 const mapMenuItem = (row) => ({
@@ -43,7 +45,7 @@ const mapMenuItem = (row) => ({
 
 async function getSettings(tenantId) {
     const rows = await db.query(
-        `SELECT restaurant_name, currency_symbol, cgst_percent, sgst_percent, tax_inclusive, enable_kot, printer_connection_type, paper_width, receipt_header, receipt_footer, order_after_bill
+        `SELECT restaurant_name, currency_symbol, cgst_percent, sgst_percent, tax_inclusive, enable_kot, printer_connection_type, paper_width, receipt_header, receipt_footer, order_after_bill, business_type
          FROM pos_settings
          WHERE tenant_id = ?
          LIMIT 1`,
@@ -215,8 +217,8 @@ router.put('/settings', async (req, res) => {
                 paper_width,
                 receipt_header,
                 receipt_footer,
-                order_after_bill
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                order_after_bill, business_type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON DUPLICATE KEY UPDATE
                 restaurant_name = VALUES(restaurant_name),
                 currency_symbol = VALUES(currency_symbol),
@@ -228,7 +230,8 @@ router.put('/settings', async (req, res) => {
                 paper_width = VALUES(paper_width),
                 receipt_header = VALUES(receipt_header),
                 receipt_footer = VALUES(receipt_footer),
-                order_after_bill = VALUES(order_after_bill)`,
+                order_after_bill = VALUES(order_after_bill),
+                business_type = VALUES(business_type)`,
             [
                 tenantId,
                 restaurantName,
@@ -723,3 +726,5 @@ router.delete('/orders/:orderCode', authorize('admin'), async (req, res) => {
 });
 
 module.exports = router;
+
+

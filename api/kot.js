@@ -1,0 +1,10 @@
+const express = require('express');
+const db = require('../utils/database');
+const { authMiddleware } = require('../middleware/auth');
+const router = express.Router();
+router.use(authMiddleware);
+router.post('/', async (req,res)=>{ const c=await db.getConnection(); try{ const t=req.user.tenant_id; const {order_code,table_id,items=[]}=req.body; if(!order_code||!items.length){c.release();return res.status(400).json({success:false,message:'order_code and items required'});} await c.beginTransaction(); const [r]=await c.execute('INSERT INTO pos_kot_tickets (tenant_id,order_code,table_id,status) VALUES (?,?,?,?)',[t,order_code,table_id||null,'PENDING']); for(const it of items){ await c.execute('INSERT INTO pos_kot_items (tenant_id,kot_id,item_name,quantity,notes) VALUES (?,?,?,?,?)',[t,r.insertId,it.name,it.qty||1,it.notes||null]); } await c.commit(); c.release(); res.status(201).json({success:true,data:{kot_id:r.insertId}}); }catch(e){ await c.rollback(); c.release(); res.status(500).json({success:false,message:'Error creating KOT'}); } });
+router.get('/', async (req,res)=>{ try{ const t=req.user.tenant_id; const st=req.query.status; let q='SELECT * FROM pos_kot_tickets WHERE tenant_id=?'; const p=[t]; if(st){q+=' AND status=?';p.push(st);} q+=' ORDER BY created_at DESC LIMIT 100'; const tickets=await db.query(q,p); if(!tickets.length) return res.json({success:true,data:[]}); const ids=tickets.map(x=>x.id); const ph=ids.map(()=>'?').join(','); const items=await db.query('SELECT * FROM pos_kot_items WHERE tenant_id=? AND kot_id IN ('+ph+')',[t,...ids]); res.json({success:true,data:tickets.map(k=>({...k,items:items.filter(i=>i.kot_id===k.id)}))}); }catch(e){ res.status(500).json({success:false,message:'Error fetching KOT'}); } });
+router.put('/:id/status', async (req,res)=>{ try{ await db.query('UPDATE pos_kot_tickets SET status=? WHERE tenant_id=? AND id=?',[req.body.status,req.user.tenant_id,req.params.id]); res.json({success:true}); }catch(e){ res.status(500).json({success:false,message:'Error updating KOT'}); } });
+module.exports = router;
+

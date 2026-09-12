@@ -14,6 +14,11 @@ const reportsRoutes = require('./api/reports');
 const mosquesRoutes = require('./api/mosques');
 const arcadeRoutes = require('./api/arcadepayment');
 const posRoutes = require('./api/pos');
+const tablesRoutes = require('./api/tables');
+const kotRoutes = require('./api/kot');
+const customersRoutes = require('./api/customers');
+const dineOrdersRoutes = require('./api/dineorders');
+const posExpensesRoutes = require('./api/posexpenses');
 const app = express();
 
 // Middleware
@@ -45,6 +50,11 @@ app.use('/api/reports', reportsRoutes);
 app.use('/api/mosques', mosquesRoutes);
 app.use('/api/arcadepayment', arcadeRoutes);
 app.use('/api/pos', posRoutes);
+app.use('/api/tables', tablesRoutes);
+app.use('/api/kot', kotRoutes);
+app.use('/api/customers', customersRoutes);
+app.use('/api/dineorders', dineOrdersRoutes);
+app.use('/api/posexpenses', posExpensesRoutes);
 
 // 404 handler
 app.use('*', (req, res) => {
@@ -75,3 +85,4 @@ if (process.env.NODE_ENV !== 'production') {
     console.log(`Server running on port ${PORT}`);
   });
 }
+
