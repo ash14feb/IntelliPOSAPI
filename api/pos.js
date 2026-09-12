@@ -44,15 +44,31 @@ const mapMenuItem = (row) => ({
 });
 
 async function getSettings(tenantId) {
-    const rows = await db.query(
-        `SELECT restaurant_name, currency_symbol, cgst_percent, sgst_percent, tax_inclusive, enable_kot, printer_connection_type, paper_width, receipt_header, receipt_footer, order_after_bill, business_type
-         FROM pos_settings
-         WHERE tenant_id = ?
-         LIMIT 1`,
-        [tenantId]
-    );
+    try {
+        const rows = await db.query(
+            `SELECT restaurant_name, currency_symbol, cgst_percent, sgst_percent, tax_inclusive, enable_kot, printer_connection_type, paper_width, receipt_header, receipt_footer, order_after_bill, business_type
+             FROM pos_settings
+             WHERE tenant_id = ?
+             LIMIT 1`,
+            [tenantId]
+        );
 
-    return mapSettingsRow(rows[0]);
+        return mapSettingsRow(rows[0]);
+    } catch (error) {
+        // Fallback for databases where Delta_001 was never applied
+        // (missing order_after_bill / business_type columns).
+        if (error && (error.code === 'ER_BAD_FIELD_ERROR' || (error.message || '').includes('Unknown column'))) {
+            const rows = await db.query(
+                `SELECT restaurant_name, currency_symbol, cgst_percent, sgst_percent, tax_inclusive, enable_kot, printer_connection_type, paper_width, receipt_header, receipt_footer
+                 FROM pos_settings
+                 WHERE tenant_id = ?
+                 LIMIT 1`,
+                [tenantId]
+            );
+            return mapSettingsRow(rows[0]);
+        }
+        throw error;
+    }
 }
 
 async function getMenuItems(tenantId) {
@@ -201,9 +217,13 @@ router.put('/settings', async (req, res) => {
             paperWidth,
             receiptHeader,
             receiptFooter,
-            orderAfterBill
+            orderAfterBill,
+        businessType
         } = req.body;
 
+        const safeBusinessType = (['FOOD','RETAIL','SERVICES','GENERAL'].indexOf(businessType) >= 0 ? businessType : 'FOOD');
+
+        try {
         await db.query(
             `INSERT INTO pos_settings (
                 tenant_id,
@@ -244,9 +264,56 @@ router.put('/settings', async (req, res) => {
                 paperWidth === '2inch' ? '2inch' : '3inch',
                 receiptHeader,
                 receiptFooter,
-                orderAfterBill ? 1 : 0
+                orderAfterBill ? 1 : 0,
+            safeBusinessType
             ]
         );
+        } catch (dbError) {
+            // Fallback when optional columns don't exist yet (Delta_001 not applied).
+            if (dbError && (dbError.code === 'ER_BAD_FIELD_ERROR' || (dbError.message || '').includes('Unknown column'))) {
+                await db.query(
+                    `INSERT INTO pos_settings (
+                        tenant_id,
+                        restaurant_name,
+                        currency_symbol,
+                        cgst_percent,
+                        sgst_percent,
+                        tax_inclusive,
+                        enable_kot,
+                        printer_connection_type,
+                        paper_width,
+                        receipt_header,
+                        receipt_footer
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON DUPLICATE KEY UPDATE
+                        restaurant_name = VALUES(restaurant_name),
+                        currency_symbol = VALUES(currency_symbol),
+                        cgst_percent = VALUES(cgst_percent),
+                        sgst_percent = VALUES(sgst_percent),
+                        tax_inclusive = VALUES(tax_inclusive),
+                        enable_kot = VALUES(enable_kot),
+                        printer_connection_type = VALUES(printer_connection_type),
+                        paper_width = VALUES(paper_width),
+                        receipt_header = VALUES(receipt_header),
+                        receipt_footer = VALUES(receipt_footer)`,
+                    [
+                        tenantId,
+                        restaurantName,
+                        currencySymbol,
+                        Number(cgstPercent || 0),
+                        Number(sgstPercent || 0),
+                        taxInclusive ? 1 : 0,
+                        enableKot === false ? 0 : 1,
+                        printerConnectionType === 'usb' ? 'usb' : 'bluetooth',
+                        paperWidth === '2inch' ? '2inch' : '3inch',
+                        receiptHeader,
+                        receiptFooter
+                    ]
+                );
+            } else {
+                throw dbError;
+            }
+        }
 
         res.json({
             success: true,
