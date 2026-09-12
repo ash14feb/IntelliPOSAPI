@@ -17,7 +17,10 @@ const DEFAULT_SETTINGS = {
     receiptHeader: 'Welcome to Intelli Billing!',
     receiptFooter: 'Thank you for visiting!',
     orderAfterBill: false,
-    businessType: 'FOOD'
+    businessType: 'FOOD',
+    enableBarcode: false,
+    enableStock: false,
+    allowSaleWhenOutOfStock: true
 };
 
 const mapSettingsRow = (row) => ({
@@ -32,21 +35,33 @@ const mapSettingsRow = (row) => ({
     receiptHeader: row?.receipt_header ?? DEFAULT_SETTINGS.receiptHeader,
     receiptFooter: row?.receipt_footer ?? DEFAULT_SETTINGS.receiptFooter,
     orderAfterBill: Boolean(row?.order_after_bill ?? DEFAULT_SETTINGS.orderAfterBill),
-    businessType: row?.business_type ?? DEFAULT_SETTINGS.businessType
+    businessType: row?.business_type ?? DEFAULT_SETTINGS.businessType,
+    enableBarcode: Boolean(row?.enable_barcode ?? DEFAULT_SETTINGS.enableBarcode),
+    enableStock: Boolean(row?.enable_stock ?? DEFAULT_SETTINGS.enableStock),
+    allowSaleWhenOutOfStock: row?.allow_sale_out_of_stock === undefined || row?.allow_sale_out_of_stock === null
+        ? DEFAULT_SETTINGS.allowSaleWhenOutOfStock
+        : Boolean(row.allow_sale_out_of_stock)
 });
+
+const toDbFlag = (value, defaultValue) => {
+    if (value === undefined || value === null) return defaultValue ? 1 : 0;
+    return value ? 1 : 0;
+};
 
 const mapMenuItem = (row) => ({
     id: String(row.id),
     name: row.name,
     price: Number(row.price),
     image: row.image_url || '',
-    category: row.category_name
+    category: row.category_name,
+    barcode: row?.barcode || '',
+    stock: row?.stock === undefined || row?.stock === null ? 0 : Number(row.stock)
 });
 
 async function getSettings(tenantId) {
     try {
         const rows = await db.query(
-            `SELECT restaurant_name, currency_symbol, cgst_percent, sgst_percent, tax_inclusive, enable_kot, printer_connection_type, paper_width, receipt_header, receipt_footer, order_after_bill, business_type
+            `SELECT restaurant_name, currency_symbol, cgst_percent, sgst_percent, tax_inclusive, enable_kot, printer_connection_type, paper_width, receipt_header, receipt_footer, order_after_bill, business_type, enable_barcode, enable_stock, allow_sale_out_of_stock
              FROM pos_settings
              WHERE tenant_id = ?
              LIMIT 1`,
@@ -55,8 +70,8 @@ async function getSettings(tenantId) {
 
         return mapSettingsRow(rows[0]);
     } catch (error) {
-        // Fallback for databases where Delta_001 was never applied
-        // (missing order_after_bill / business_type columns).
+        // Fallback for databases where deltas were never applied
+        // (missing order_after_bill / business_type / inventory columns).
         if (error && (error.code === 'ER_BAD_FIELD_ERROR' || (error.message || '').includes('Unknown column'))) {
             const rows = await db.query(
                 `SELECT restaurant_name, currency_symbol, cgst_percent, sgst_percent, tax_inclusive, enable_kot, printer_connection_type, paper_width, receipt_header, receipt_footer
@@ -72,21 +87,44 @@ async function getSettings(tenantId) {
 }
 
 async function getMenuItems(tenantId) {
-    const rows = await db.query(
-        `SELECT
-            p.id,
-            p.name,
-            p.price,
-            p.image_url,
-            c.name AS category_name
-         FROM pos_products p
-         INNER JOIN pos_categories c ON c.id = p.category_id
-         WHERE p.tenant_id = ? AND c.tenant_id = ? AND p.is_active = 1 AND c.is_active = 1
-         ORDER BY c.sort_order ASC, c.name ASC, p.sort_order ASC, p.name ASC`,
-        [tenantId, tenantId]
-    );
+    try {
+        const rows = await db.query(
+            `SELECT
+                p.id,
+                p.name,
+                p.price,
+                p.image_url,
+                p.barcode,
+                p.stock,
+                c.name AS category_name
+             FROM pos_products p
+             INNER JOIN pos_categories c ON c.id = p.category_id
+             WHERE p.tenant_id = ? AND c.tenant_id = ? AND p.is_active = 1 AND c.is_active = 1
+             ORDER BY c.sort_order ASC, c.name ASC, p.sort_order ASC, p.name ASC`,
+            [tenantId, tenantId]
+        );
 
-    return rows.map(mapMenuItem);
+        return rows.map(mapMenuItem);
+    } catch (error) {
+        // Fallback for databases where Delta_002 was never applied.
+        if (error && (error.code === 'ER_BAD_FIELD_ERROR' || (error.message || '').includes('Unknown column'))) {
+            const rows = await db.query(
+                `SELECT
+                    p.id,
+                    p.name,
+                    p.price,
+                    p.image_url,
+                    c.name AS category_name
+                 FROM pos_products p
+                 INNER JOIN pos_categories c ON c.id = p.category_id
+                 WHERE p.tenant_id = ? AND c.tenant_id = ? AND p.is_active = 1 AND c.is_active = 1
+                 ORDER BY c.sort_order ASC, c.name ASC, p.sort_order ASC, p.name ASC`,
+                [tenantId, tenantId]
+            );
+            return rows.map(mapMenuItem);
+        }
+        throw error;
+    }
 }
 
 async function getCategories(tenantId) {
@@ -218,7 +256,10 @@ router.put('/settings', async (req, res) => {
             receiptHeader,
             receiptFooter,
             orderAfterBill,
-        businessType
+        businessType,
+            enableBarcode,
+            enableStock,
+            allowSaleWhenOutOfStock
         } = req.body;
 
         const safeBusinessType = (['FOOD','RETAIL','SERVICES','GENERAL'].indexOf(businessType) >= 0 ? businessType : 'FOOD');
@@ -237,8 +278,8 @@ router.put('/settings', async (req, res) => {
                 paper_width,
                 receipt_header,
                 receipt_footer,
-                order_after_bill, business_type
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                order_after_bill, business_type, enable_barcode, enable_stock, allow_sale_out_of_stock
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON DUPLICATE KEY UPDATE
                 restaurant_name = VALUES(restaurant_name),
                 currency_symbol = VALUES(currency_symbol),
@@ -251,7 +292,10 @@ router.put('/settings', async (req, res) => {
                 receipt_header = VALUES(receipt_header),
                 receipt_footer = VALUES(receipt_footer),
                 order_after_bill = VALUES(order_after_bill),
-                business_type = VALUES(business_type)`,
+                business_type = VALUES(business_type),
+                enable_barcode = VALUES(enable_barcode),
+                enable_stock = VALUES(enable_stock),
+                allow_sale_out_of_stock = VALUES(allow_sale_out_of_stock)`,
             [
                 tenantId,
                 restaurantName,
@@ -265,7 +309,10 @@ router.put('/settings', async (req, res) => {
                 receiptHeader,
                 receiptFooter,
                 orderAfterBill ? 1 : 0,
-            safeBusinessType
+            safeBusinessType,
+                toDbFlag(enableBarcode, false),
+                toDbFlag(enableStock, false),
+                toDbFlag(allowSaleWhenOutOfStock, true)
             ]
         );
         } catch (dbError) {
@@ -482,7 +529,7 @@ router.delete('/categories/:id', async (req, res) => {
 router.post('/menu-items', async (req, res) => {
     try {
         const tenantId = req.user.tenant_id;
-        const { name, price, image, category } = req.body;
+        const { name, price, image, category, barcode, stock } = req.body;
 
         if (!name || price === undefined || price === null || !category) {
             return res.status(400).json({
@@ -490,6 +537,9 @@ router.post('/menu-items', async (req, res) => {
                 message: 'name, price, and category are required'
             });
         }
+
+        const safeBarcode = (barcode || '').toString().trim() || null;
+        const safeStock = Math.max(0, Number(stock ?? 0) || 0);
 
         const existingCategory = await db.query(
             'SELECT id FROM pos_categories WHERE tenant_id = ? AND name = ? LIMIT 1',
@@ -507,31 +557,76 @@ router.post('/menu-items', async (req, res) => {
             categoryId = categoryResult.insertId;
         }
 
-        const result = await db.query(
-            `INSERT INTO pos_products (
-                tenant_id,
-                category_id,
-                name,
-                price,
-                image_url,
-                sort_order,
-                is_active
-            ) VALUES (?, ?, ?, ?, ?, 999, 1)`,
-            [tenantId, categoryId, name.trim(), Number(price), image || '']
-        );
+        let result;
+        try {
+            result = await db.query(
+                `INSERT INTO pos_products (
+                    tenant_id,
+                    category_id,
+                    name,
+                    price,
+                    image_url,
+                    barcode,
+                    stock,
+                    sort_order,
+                    is_active
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 999, 1)`,
+                [tenantId, categoryId, name.trim(), Number(price), image || '', safeBarcode, safeStock]
+            );
+        } catch (insertError) {
+            // Fallback when Delta_002 columns don't exist yet.
+            if (insertError && (insertError.code === 'ER_BAD_FIELD_ERROR' || (insertError.message || '').includes('Unknown column'))) {
+                result = await db.query(
+                    `INSERT INTO pos_products (
+                        tenant_id,
+                        category_id,
+                        name,
+                        price,
+                        image_url,
+                        sort_order,
+                        is_active
+                    ) VALUES (?, ?, ?, ?, ?, 999, 1)`,
+                    [tenantId, categoryId, name.trim(), Number(price), image || '']
+                );
+            } else {
+                throw insertError;
+            }
+        }
 
-        const createdRows = await db.query(
-            `SELECT
-                p.id,
-                p.name,
-                p.price,
-                p.image_url,
-                c.name AS category_name
-             FROM pos_products p
-             INNER JOIN pos_categories c ON c.id = p.category_id
-             WHERE p.tenant_id = ? AND p.id = ?`,
-            [tenantId, result.insertId]
-        );
+        let createdRows;
+        try {
+            createdRows = await db.query(
+                `SELECT
+                    p.id,
+                    p.name,
+                    p.price,
+                    p.image_url,
+                    p.barcode,
+                    p.stock,
+                    c.name AS category_name
+                 FROM pos_products p
+                 INNER JOIN pos_categories c ON c.id = p.category_id
+                 WHERE p.tenant_id = ? AND p.id = ?`,
+                [tenantId, result.insertId]
+            );
+        } catch (selectError) {
+            if (selectError && (selectError.code === 'ER_BAD_FIELD_ERROR' || (selectError.message || '').includes('Unknown column'))) {
+                createdRows = await db.query(
+                    `SELECT
+                        p.id,
+                        p.name,
+                        p.price,
+                        p.image_url,
+                        c.name AS category_name
+                     FROM pos_products p
+                     INNER JOIN pos_categories c ON c.id = p.category_id
+                     WHERE p.tenant_id = ? AND p.id = ?`,
+                    [tenantId, result.insertId]
+                );
+            } else {
+                throw selectError;
+            }
+        }
 
         res.status(201).json({
             success: true,
@@ -550,7 +645,7 @@ router.put('/menu-items/:id', async (req, res) => {
     try {
         const tenantId = req.user.tenant_id;
         const { id } = req.params;
-        const { name, price, image, category } = req.body;
+        const { name, price, image, category, barcode, stock } = req.body;
 
         if (!name || price === undefined || price === null || !category) {
             return res.status(400).json({
@@ -587,25 +682,64 @@ router.put('/menu-items/:id', async (req, res) => {
             categoryId = categoryResult.insertId;
         }
 
-        await db.query(
-            `UPDATE pos_products
-             SET category_id = ?, name = ?, price = ?, image_url = ?
-             WHERE tenant_id = ? AND id = ?`,
-            [categoryId, name.trim(), Number(price), image || '', tenantId, id]
-        );
+        const safeBarcode = (barcode || '').toString().trim() || null;
+        const safeStock = Math.max(0, Number(stock ?? 0) || 0);
 
-        const updatedRows = await db.query(
-            `SELECT
-                p.id,
-                p.name,
-                p.price,
-                p.image_url,
-                c.name AS category_name
-             FROM pos_products p
-             INNER JOIN pos_categories c ON c.id = p.category_id
-             WHERE p.tenant_id = ? AND p.id = ?`,
-            [tenantId, id]
-        );
+        try {
+            await db.query(
+                `UPDATE pos_products
+                 SET category_id = ?, name = ?, price = ?, image_url = ?, barcode = ?, stock = ?
+                 WHERE tenant_id = ? AND id = ?`,
+                [categoryId, name.trim(), Number(price), image || '', safeBarcode, safeStock, tenantId, id]
+            );
+        } catch (updateError) {
+            // Fallback when Delta_002 columns don't exist yet.
+            if (updateError && (updateError.code === 'ER_BAD_FIELD_ERROR' || (updateError.message || '').includes('Unknown column'))) {
+                await db.query(
+                    `UPDATE pos_products
+                     SET category_id = ?, name = ?, price = ?, image_url = ?
+                     WHERE tenant_id = ? AND id = ?`,
+                    [categoryId, name.trim(), Number(price), image || '', tenantId, id]
+                );
+            } else {
+                throw updateError;
+            }
+        }
+
+        let updatedRows;
+        try {
+            updatedRows = await db.query(
+                `SELECT
+                    p.id,
+                    p.name,
+                    p.price,
+                    p.image_url,
+                    p.barcode,
+                    p.stock,
+                    c.name AS category_name
+                 FROM pos_products p
+                 INNER JOIN pos_categories c ON c.id = p.category_id
+                 WHERE p.tenant_id = ? AND p.id = ?`,
+                [tenantId, id]
+            );
+        } catch (selectError) {
+            if (selectError && (selectError.code === 'ER_BAD_FIELD_ERROR' || (selectError.message || '').includes('Unknown column'))) {
+                updatedRows = await db.query(
+                    `SELECT
+                        p.id,
+                        p.name,
+                        p.price,
+                        p.image_url,
+                        c.name AS category_name
+                     FROM pos_products p
+                     INNER JOIN pos_categories c ON c.id = p.category_id
+                     WHERE p.tenant_id = ? AND p.id = ?`,
+                    [tenantId, id]
+                );
+            } else {
+                throw selectError;
+            }
+        }
 
         res.json({
             success: true,
