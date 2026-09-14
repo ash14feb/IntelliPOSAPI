@@ -3,6 +3,55 @@ const db = require('../utils/database');
 const { authMiddleware, authorize } = require('../middleware/auth');
 
 const router = express.Router();
+
+// Public bill fetch (no auth — opened on customer phone).
+// Returns the same object POS stored via POST /api/pos/orders, looked up by order_code.
+router.get('/bills/:orderId', async (req, res) => {
+    try {
+        const orderId = String(req.params.orderId || '').trim();
+        if (!orderId) return res.status(404).json({ success: false, message: 'Bill not found' });
+        const orderRows = await db.query(
+            `SELECT id, order_code, created_at, subtotal, discount, cgst_amount, sgst_amount,
+                    total_amount, payment_mode, customer_name, customer_phone
+             FROM pos_orders WHERE order_code = ? LIMIT 1`,
+            [orderId]
+        );
+        if (!orderRows.length) return res.status(404).json({ success: false, message: 'Bill not found' });
+        const o = orderRows[0];
+        const itemRows = await db.query(
+            `SELECT oi.quantity, oi.unit_price, oi.line_total, oi.item_name, oi.item_category, oi.item_image
+             FROM pos_order_items oi WHERE oi.order_id = ? ORDER BY oi.id ASC`,
+            [o.id]
+        );
+        // Normalize possible legacy flexible field shapes
+        const items = itemRows.map((r, i) => ({
+            id: i + 1,
+            name: r.item_name,
+            price: Number(r.unit_price),
+            qty: Number(r.quantity),
+        }));
+        res.json({
+            success: true,
+            data: {
+                id: o.order_code,
+                timestamp: new Date(o.created_at).getTime(),
+                items,
+                subtotal: Number(o.subtotal),
+                discount: Number(o.discount),
+                cgst: Number(o.cgst_amount),
+                sgst: Number(o.sgst_amount),
+                total: Number(o.total_amount),
+                paymentMode: o.payment_mode,
+                customerName: o.customer_name || undefined,
+                customerPhone: o.customer_phone || undefined,
+            },
+        });
+    } catch (e) {
+        console.error('Public bill fetch error:', e);
+        res.status(500).json({ success: false, message: 'Error fetching bill' });
+    }
+});
+
 router.use(authMiddleware);
 
 const DEFAULT_SETTINGS = {
