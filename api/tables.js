@@ -76,15 +76,12 @@ router.get('/menu/:code', async (req, res) => {
 });
 
 router.use(authMiddleware);
-// floors (kept for backwards compatibility; UI no longer uses them)
-router.get('/floors', async (req,res)=>{ try{ const r=await db.query('SELECT * FROM pos_floors WHERE tenant_id=? AND is_active=1 ORDER BY sort_order,name',[req.user.tenant_id]); res.json({success:true,data:r}); }catch(e){ res.status(500).json({success:false,message:'Error fetching floors'}); } });
-router.post('/floors', async (req,res)=>{ try{ const r=await db.query('INSERT INTO pos_floors (tenant_id,name,sort_order) VALUES (?,?,?)',[req.user.tenant_id,req.body.name,req.body.sort_order||0]); res.status(201).json({success:true,data:{id:r.insertId,...req.body}}); }catch(e){ res.status(500).json({success:false,message:'Error creating floor'}); } });
-// tables
+// tables only — no floor concept
 router.get('/', async (req,res)=>{
     try{
         const hasCode = await ensureMenuCodeColumn();
         const r=await db.query(
-            'SELECT t.*,f.name as floor_name FROM pos_tables t LEFT JOIN pos_floors f ON f.id=t.floor_id WHERE t.tenant_id=? AND t.is_active=1 ORDER BY t.table_no',
+            'SELECT t.* FROM pos_tables t WHERE t.tenant_id=? AND t.is_active=1 ORDER BY t.table_no',
             [req.user.tenant_id]
         );
         // Backfill missing menu codes so every table gets a unique link.
@@ -109,10 +106,10 @@ router.post('/', async (req,res)=>{
         const hasCode = await ensureMenuCodeColumn();
         if (hasCode) {
             const code = newMenuCode();
-            const r=await db.query('INSERT INTO pos_tables (tenant_id,floor_id,table_no,seats,menu_code) VALUES (?,?,?,?,?)',[req.user.tenant_id,null,String(table_no).trim(),Number(seats)||4,code]);
+            const r=await db.query('INSERT INTO pos_tables (tenant_id,table_no,seats,menu_code) VALUES (?,?,?,?)',[req.user.tenant_id,String(table_no).trim(),Number(seats)||4,code]);
             return res.status(201).json({success:true,data:{id:r.insertId,menu_code:code}});
         }
-        const r=await db.query('INSERT INTO pos_tables (tenant_id,floor_id,table_no,seats) VALUES (?,?,?,?)',[req.user.tenant_id,null,String(table_no).trim(),Number(seats)||4]);
+        const r=await db.query('INSERT INTO pos_tables (tenant_id,table_no,seats) VALUES (?,?,?)',[req.user.tenant_id,String(table_no).trim(),Number(seats)||4]);
         res.status(201).json({success:true,data:{id:r.insertId}});
     } catch(e){ res.status(500).json({success:false,message:'Table exists or error'}); }
 });
