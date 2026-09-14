@@ -11,13 +11,22 @@ router.get('/bills/:orderId', async (req, res) => {
         const orderId = String(req.params.orderId || '').trim();
         if (!orderId) return res.status(404).json({ success: false, message: 'Bill not found' });
         const orderRows = await db.query(
-            `SELECT id, order_code, created_at, subtotal, discount, cgst_amount, sgst_amount,
+            `SELECT id, tenant_id, order_code, created_at, subtotal, discount, cgst_amount, sgst_amount,
                     total_amount, payment_mode, customer_name, customer_phone
              FROM pos_orders WHERE order_code = ? LIMIT 1`,
             [orderId]
         );
         if (!orderRows.length) return res.status(404).json({ success: false, message: 'Bill not found' });
         const o = orderRows[0];
+        let store = {};
+        try {
+            const srows = await db.query(
+                `SELECT restaurant_name, receipt_header, receipt_footer, currency_symbol
+                 FROM pos_settings WHERE tenant_id = ? LIMIT 1`,
+                [o.tenant_id]
+            );
+            store = srows[0] || {};
+        } catch (e) { /* settings optional */ }
         const itemRows = await db.query(
             `SELECT oi.quantity, oi.unit_price, oi.line_total, oi.item_name, oi.item_category, oi.item_image
              FROM pos_order_items oi WHERE oi.order_id = ? ORDER BY oi.id ASC`,
@@ -44,6 +53,11 @@ router.get('/bills/:orderId', async (req, res) => {
                 paymentMode: o.payment_mode,
                 customerName: o.customer_name || undefined,
                 customerPhone: o.customer_phone || undefined,
+                businessName: store.restaurant_name || undefined,
+                restaurantName: store.restaurant_name || undefined,
+                receiptHeader: store.receipt_header || undefined,
+                receiptFooter: store.receipt_footer || undefined,
+                currencySymbol: store.currency_symbol || undefined,
             },
         });
     } catch (e) {
