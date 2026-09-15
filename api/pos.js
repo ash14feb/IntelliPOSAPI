@@ -81,6 +81,7 @@ const DEFAULT_SETTINGS = {
     receiptFooter: 'Thank you for visiting!',
     orderAfterBill: false,
     businessType: 'FOOD',
+    dineInEnabled: false,
     enableBarcode: false,
     enableStock: false,
     allowSaleWhenOutOfStock: true
@@ -93,12 +94,13 @@ const mapSettingsRow = (row) => ({
     sgstPercent: Number(row?.sgst_percent ?? DEFAULT_SETTINGS.sgstPercent),
     taxInclusive: Boolean(row?.tax_inclusive ?? DEFAULT_SETTINGS.taxInclusive),
     enableKot: Boolean(row?.enable_kot ?? DEFAULT_SETTINGS.enableKot),
-    printerConnectionType: row?.printer_connection_type ?? DEFAULT_SETTINGS.printerConnectionType,
+    printerConnectionType: row?.printer_connection_type ?? 'ebill',
     paperWidth: row?.paper_width ?? DEFAULT_SETTINGS.paperWidth,
     receiptHeader: row?.receipt_header ?? DEFAULT_SETTINGS.receiptHeader,
     receiptFooter: row?.receipt_footer ?? DEFAULT_SETTINGS.receiptFooter,
     orderAfterBill: Boolean(row?.order_after_bill ?? DEFAULT_SETTINGS.orderAfterBill),
     businessType: row?.business_type ?? DEFAULT_SETTINGS.businessType,
+    dineInEnabled: Boolean(row?.dine_in_enabled ?? DEFAULT_SETTINGS.dineInEnabled),
     enableBarcode: Boolean(row?.enable_barcode ?? DEFAULT_SETTINGS.enableBarcode),
     enableStock: Boolean(row?.enable_stock ?? DEFAULT_SETTINGS.enableStock),
     allowSaleWhenOutOfStock: row?.allow_sale_out_of_stock === undefined || row?.allow_sale_out_of_stock === null
@@ -196,7 +198,7 @@ const sanitizeExtended = (b) => {
 async function getSettings(tenantId) {
     try {
         const rows = await db.query(
-            `SELECT restaurant_name, currency_symbol, cgst_percent, sgst_percent, tax_inclusive, enable_kot, printer_connection_type, paper_width, receipt_header, receipt_footer, order_after_bill, business_type, enable_barcode, enable_stock, allow_sale_out_of_stock
+            `SELECT restaurant_name, currency_symbol, cgst_percent, sgst_percent, tax_inclusive, enable_kot, printer_connection_type, paper_width, receipt_header, receipt_footer, order_after_bill, business_type, dine_in_enabled, enable_barcode, enable_stock, allow_sale_out_of_stock
              FROM pos_settings
              WHERE tenant_id = ?
              LIMIT 1`,
@@ -282,8 +284,7 @@ async function getCategories(tenantId) {
 async function getOrders(tenantId, limit = 100) {
     const safeLimit = Number.isFinite(Number(limit)) ? Math.max(1, Math.min(500, Number(limit))) : 100;
 
-    const orderRows = await db.query(
-        `SELECT
+    const orderSelect = (extra) => `SELECT
             id,
             order_code,
             created_at,
@@ -294,13 +295,20 @@ async function getOrders(tenantId, limit = 100) {
             total_amount,
             payment_mode,
             customer_name,
-            customer_phone
+            customer_phone${extra}
          FROM pos_orders
          WHERE tenant_id = ?
          ORDER BY created_at DESC
-         LIMIT ${safeLimit}`,
-        [tenantId]
-    );
+         LIMIT ${safeLimit}`;
+    let orderRows;
+    try {
+        orderRows = await db.query(orderSelect(`,\n            order_type,\n            table_id`), [tenantId]);
+    } catch (e) {
+        // Delta_001 not applied: order_type/table_id missing.
+        if (e && (e.code === 'ER_BAD_FIELD_ERROR' || e.errno === 1054 || (e.message || '').includes('Unknown column'))) {
+            orderRows = await db.query(orderSelect(''), [tenantId]);
+        } else { throw e; }
+    }
 
     if (orderRows.length === 0) {
         return [];
@@ -350,7 +358,9 @@ async function getOrders(tenantId, limit = 100) {
         total: Number(row.total_amount),
         paymentMode: row.payment_mode,
         customerName: row.customer_name || undefined,
-        customerPhone: row.customer_phone || undefined
+        customerPhone: row.customer_phone || undefined,
+        orderType: row.order_type || undefined,
+        tableId: row.table_id ?? undefined
     }));
 }
 
@@ -406,31 +416,29 @@ router.put('/settings', async (req, res) => {
             receiptFooter,
             orderAfterBill,
         businessType,
+            dineInEnabled,
             enableBarcode,
             enableStock,
             allowSaleWhenOutOfStock
         } = req.body;
 
         const safeBusinessType = (['FOOD','RETAIL','SERVICES','GENERAL'].indexOf(businessType) >= 0 ? businessType : 'FOOD');
+        const isMissingColumn = (e) => e && (e.code === 'ER_BAD_FIELD_ERROR' || e.errno === 1054 || (e.message || '').includes('Unknown column'));
 
-        try {
-        await db.query(
-            `INSERT INTO pos_settings (
-                tenant_id,
-                restaurant_name,
-                currency_symbol,
-                cgst_percent,
-                sgst_percent,
-                tax_inclusive,
-                enable_kot,
-                printer_connection_type,
-                paper_width,
-                receipt_header,
-                receipt_footer,
-                order_after_bill, business_type, enable_barcode, enable_stock, allow_sale_out_of_stock
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON DUPLICATE KEY UPDATE
-                restaurant_name = VALUES(restaurant_name),
+        const baseVals = [
+                tenantId,
+                restaurantName,
+                currencySymbol,
+                Number(cgstPercent || 0),
+                Number(sgstPercent || 0),
+                taxInclusive ? 1 : 0,
+                enableKot === false ? 0 : 1,
+                printerConnectionType === 'usb' ? 'usb' : printerConnectionType === 'ebill' ? 'ebill' : 'bluetooth',
+                paperWidth === '2inch' ? '2inch' : '3inch',
+                receiptHeader,
+                receiptFooter
+        ];
+        const baseUpdate = `restaurant_name = VALUES(restaurant_name),
                 currency_symbol = VALUES(currency_symbol),
                 cgst_percent = VALUES(cgst_percent),
                 sgst_percent = VALUES(sgst_percent),
@@ -439,34 +447,39 @@ router.put('/settings', async (req, res) => {
                 printer_connection_type = VALUES(printer_connection_type),
                 paper_width = VALUES(paper_width),
                 receipt_header = VALUES(receipt_header),
-                receipt_footer = VALUES(receipt_footer),
-                order_after_bill = VALUES(order_after_bill),
-                business_type = VALUES(business_type),
-                enable_barcode = VALUES(enable_barcode),
-                enable_stock = VALUES(enable_stock),
-                allow_sale_out_of_stock = VALUES(allow_sale_out_of_stock)`,
-            [
-                tenantId,
-                restaurantName,
-                currencySymbol,
-                Number(cgstPercent || 0),
-                Number(sgstPercent || 0),
-                taxInclusive ? 1 : 0,
-                enableKot === false ? 0 : 1,
-                printerConnectionType === 'usb' ? 'usb' : 'bluetooth',
-                paperWidth === '2inch' ? '2inch' : '3inch',
-                receiptHeader,
-                receiptFooter,
+                receipt_footer = VALUES(receipt_footer)`;
+        const d1Cols = `order_after_bill, business_type, enable_barcode, enable_stock, allow_sale_out_of_stock`;
+        const d1Vals = [
                 orderAfterBill ? 1 : 0,
             safeBusinessType,
                 toDbFlag(enableBarcode, false),
                 toDbFlag(enableStock, false),
                 toDbFlag(allowSaleWhenOutOfStock, true)
-            ]
-        );
-        } catch (dbError) {
-            // Fallback when optional columns don't exist yet (Delta_001 not applied).
-            if (dbError && (dbError.code === 'ER_BAD_FIELD_ERROR' || (dbError.message || '').includes('Unknown column'))) {
+        ];
+        const d1Update = `order_after_bill = VALUES(order_after_bill),
+                business_type = VALUES(business_type),
+                enable_barcode = VALUES(enable_barcode),
+                enable_stock = VALUES(enable_stock),
+                allow_sale_out_of_stock = VALUES(allow_sale_out_of_stock)`;
+
+        // Tiered save: full (Delta_007) -> Delta_001 level -> base.
+        // A live DB missing only dine_in_enabled must still persist business_type etc.
+        const attempts = [
+            {
+                cols: `${d1Cols}, dine_in_enabled`,
+                vals: [...d1Vals, toDbFlag(dineInEnabled, false)],
+                update: `${d1Update}, dine_in_enabled = VALUES(dine_in_enabled)`,
+            },
+            { cols: d1Cols, vals: d1Vals, update: d1Update },
+            { cols: '', vals: [], update: '' },
+        ];
+        let saved = false;
+        let lastError = null;
+        for (const a of attempts) {
+            const colsSql = a.cols ? `,\n                ${a.cols}` : '';
+            const placeholders = a.vals.length ? `, ${a.vals.map(() => '?').join(', ')}` : '';
+            const updateSql = a.update ? `,\n                ${a.update}` : '';
+            try {
                 await db.query(
                     `INSERT INTO pos_settings (
                         tenant_id,
@@ -479,37 +492,23 @@ router.put('/settings', async (req, res) => {
                         printer_connection_type,
                         paper_width,
                         receipt_header,
-                        receipt_footer
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        receipt_footer${colsSql}
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${placeholders})
                     ON DUPLICATE KEY UPDATE
-                        restaurant_name = VALUES(restaurant_name),
-                        currency_symbol = VALUES(currency_symbol),
-                        cgst_percent = VALUES(cgst_percent),
-                        sgst_percent = VALUES(sgst_percent),
-                        tax_inclusive = VALUES(tax_inclusive),
-                        enable_kot = VALUES(enable_kot),
-                        printer_connection_type = VALUES(printer_connection_type),
-                        paper_width = VALUES(paper_width),
-                        receipt_header = VALUES(receipt_header),
-                        receipt_footer = VALUES(receipt_footer)`,
-                    [
-                        tenantId,
-                        restaurantName,
-                        currencySymbol,
-                        Number(cgstPercent || 0),
-                        Number(sgstPercent || 0),
-                        taxInclusive ? 1 : 0,
-                        enableKot === false ? 0 : 1,
-                        printerConnectionType === 'usb' ? 'usb' : 'bluetooth',
-                        paperWidth === '2inch' ? '2inch' : '3inch',
-                        receiptHeader,
-                        receiptFooter
-                    ]
+                        ${baseUpdate}${updateSql}`,
+                    [...baseVals, ...a.vals]
                 );
-            } else {
-                throw dbError;
+                saved = true;
+                if (a.cols === '' || !a.cols.includes('dine_in_enabled')) {
+                    console.warn('POS settings saved without some optional columns (delta not applied on DB).');
+                }
+                break;
+            } catch (dbError) {
+                if (!isMissingColumn(dbError)) throw dbError;
+                lastError = dbError;
             }
         }
+        if (!saved) throw lastError;
 
         res.json({
             success: true,
@@ -1080,7 +1079,9 @@ router.post('/orders', async (req, res) => {
         // Sync table status: SAVE -> OCCUPIED, PAID/COMPLETED -> FREE (best effort).
         try {
             if (safeTableId) {
-                if (['ACTIVE','SAVED','OCCUPIED'].includes(safeStatus)) {
+                if (safeStatus === 'SERVED') {
+                    await db.query(`UPDATE pos_tables SET status='HAVING_FOOD', current_order_code=? WHERE tenant_id=? AND id=?`, [id, tenantId, safeTableId]);
+                } else if (['ACTIVE','SAVED','OCCUPIED'].includes(safeStatus)) {
                     await db.query(`UPDATE pos_tables SET status='OCCUPIED', current_order_code=? WHERE tenant_id=? AND id=?`, [id, tenantId, safeTableId]);
                 } else if (['PAID','COMPLETED'].includes(safeStatus)) {
                     await db.query(`UPDATE pos_tables SET status='FREE', current_order_code=NULL WHERE tenant_id=? AND id=?`, [tenantId, safeTableId]);
@@ -1139,12 +1140,31 @@ router.put('/orders/:orderCode', async (req, res) => {
         connection.release();
         const st = String(orderStatus || '').toUpperCase();
         const tid = tableId !== undefined ? (tableId ? Number(tableId) : null) : (order.table_id ? Number(order.table_id) : null);
-        try {
-            if (tid) {
-                if (['SERVED','ACTIVE','SAVED'].includes(st)) await db.query(`UPDATE pos_tables SET status='OCCUPIED', current_order_code=? WHERE tenant_id=? AND id=?`, [orderCode, tenantId, tid]);
-                else if (['PAID','COMPLETED'].includes(st)) await db.query(`UPDATE pos_tables SET status='FREE', current_order_code=NULL WHERE tenant_id=? AND id=?`, [tenantId, tid]);
-            }
-        } catch {}
+        const syncTableStatus = async (code, tenantId, tid, st) => {
+            if (!tid) return;
+            try {
+                if (st === 'SERVED') {
+                    await db.query(`UPDATE pos_tables SET status='HAVING_FOOD', current_order_code=? WHERE tenant_id=? AND id=?`, [code, tenantId, tid]);
+                } else if (['PAID','COMPLETED'].includes(st)) {
+                    await db.query(`UPDATE pos_tables SET status='FREE', current_order_code=NULL WHERE tenant_id=? AND id=?`, [tenantId, tid]);
+                } else if (['ACTIVE','SAVED','OCCUPIED'].includes(st)) {
+                    // Preserve meaningful states (e.g. CUSTOMER_ORDERED self-orders,
+                    // HAVING_FOOD served tables); only lift FREE tables to OCCUPIED.
+                    try {
+                        const cur = await db.query(`SELECT status FROM pos_tables WHERE tenant_id=? AND id=? LIMIT 1`, [tenantId, tid]);
+                        const cs = String(cur[0]?.status || 'FREE').toUpperCase();
+                        if (['FREE','RESERVED','BILLED'].includes(cs)) {
+                            await db.query(`UPDATE pos_tables SET status='OCCUPIED', current_order_code=? WHERE tenant_id=? AND id=?`, [code, tenantId, tid]);
+                        } else {
+                            await db.query(`UPDATE pos_tables SET current_order_code=? WHERE tenant_id=? AND id=?`, [code, tenantId, tid]);
+                        }
+                    } catch {
+                        await db.query(`UPDATE pos_tables SET status='OCCUPIED', current_order_code=? WHERE tenant_id=? AND id=?`, [code, tenantId, tid]);
+                    }
+                }
+            } catch {}
+        };
+        await syncTableStatus(orderCode, tenantId, tid, st);
         res.json({ success: true });
     } catch (error) {
         try { await connection.rollback(); } catch {}

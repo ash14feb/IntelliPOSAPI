@@ -39,7 +39,17 @@ router.put("/:code/status", async (req,res)=>{
       const rows = await db.query("SELECT table_id FROM pos_orders WHERE tenant_id=? AND order_code=? LIMIT 1", [req.user.tenant_id, req.params.code]);
       const tid = rows[0]?.table_id;
       if (tid) {
-        if (['SERVED','ACTIVE','SAVED'].includes(status)) await db.query("UPDATE pos_tables SET status='OCCUPIED', current_order_code=? WHERE tenant_id=? AND id=?", [req.params.code, req.user.tenant_id, tid]);
+        // Table lifecycle: ACTIVE/SAVED -> OCCUPIED (unless already meaningful),
+        // SERVED -> HAVING_FOOD, PAID -> FREE.
+        if (status === 'SERVED') await db.query("UPDATE pos_tables SET status='HAVING_FOOD', current_order_code=? WHERE tenant_id=? AND id=?", [req.params.code, req.user.tenant_id, tid]);
+        else if (['ACTIVE','SAVED','OCCUPIED'].includes(status)) {
+          try {
+            const cur = await db.query("SELECT status FROM pos_tables WHERE tenant_id=? AND id=? LIMIT 1", [req.user.tenant_id, tid]);
+            const cs = String(cur[0]?.status || 'FREE').toUpperCase();
+            if (['FREE','RESERVED','BILLED'].includes(cs)) await db.query("UPDATE pos_tables SET status='OCCUPIED', current_order_code=? WHERE tenant_id=? AND id=?", [req.params.code, req.user.tenant_id, tid]);
+            else await db.query("UPDATE pos_tables SET current_order_code=? WHERE tenant_id=? AND id=?", [req.params.code, req.user.tenant_id, tid]);
+          } catch { await db.query("UPDATE pos_tables SET status='OCCUPIED', current_order_code=? WHERE tenant_id=? AND id=?", [req.params.code, req.user.tenant_id, tid]); }
+        }
         else if (['PAID','COMPLETED'].includes(status)) await db.query("UPDATE pos_tables SET status='FREE', current_order_code=NULL WHERE tenant_id=? AND id=?", [req.user.tenant_id, tid]);
       }
     } catch {}
