@@ -226,45 +226,41 @@ async function getMenuItems(tenantId) {
                 p.id,
                 p.name,
                 p.price,
-                p.image_url,
-                p.barcode,
-                p.stock,${extra}
+                p.image_url${extra}
                 c.name AS category_name
               FROM pos_products p
               INNER JOIN pos_categories c ON c.id = p.category_id
               WHERE p.tenant_id = ? AND c.tenant_id = ? AND p.is_active = 1 AND c.is_active = 1
               ORDER BY c.sort_order ASC, c.name ASC, p.sort_order ASC, p.name ASC`;
-    const ext = `,
+    // Tier order matters: live DBs may have Delta_002 (barcode/stock) but not Delta_004 (extended).
+    // Each fragment supplies the comma(s) around itself: `p.image_url<extra> c.name ...`.
+    const tiers = [
+        `,
+                p.barcode,
+                p.stock,
                 p.mrp, p.unit, p.description, p.dietary_type, p.hsn_sac, p.tax_rate,
                 p.purchase_price, p.wholesale_price, p.min_wholesale_qty, p.portion_size,
-                p.stock_in_date, p.low_stock_alert`;
-    try {
-        const rows = await db.query(baseSelect(ext), [tenantId, tenantId]);
-
-        const items = rows.map(mapMenuItem);
-        const vmap = await getVariantsMap(tenantId, items.map((i) => Number(i.id)));
-        for (const it of items) it.variants = vmap.get(Number(it.id)) || [];
-        return items;
-    } catch (error) {
-        // Fallback for databases where Delta_002 was never applied.
-        if (error && (error.code === 'ER_BAD_FIELD_ERROR' || (error.message || '').includes('Unknown column'))) {
-            const rows = await db.query(
-                `SELECT
-                    p.id,
-                    p.name,
-                    p.price,
-                    p.image_url,
-                    c.name AS category_name
-                 FROM pos_products p
-                 INNER JOIN pos_categories c ON c.id = p.category_id
-                 WHERE p.tenant_id = ? AND c.tenant_id = ? AND p.is_active = 1 AND c.is_active = 1
-                 ORDER BY c.sort_order ASC, c.name ASC, p.sort_order ASC, p.name ASC`,
-                [tenantId, tenantId]
-            );
-            return rows.map(mapMenuItem);
+                p.stock_in_date, p.low_stock_alert,`,
+        `,
+                p.barcode,
+                p.stock,`,
+        `,`,
+    ];
+    const isMissingColumn = (e) => e && (e.code === 'ER_BAD_FIELD_ERROR' || (e.errno === 1054) || (e.message || '').includes('Unknown column'));
+    let lastError = null;
+    for (const extra of tiers) {
+        try {
+            const rows = await db.query(baseSelect(extra), [tenantId, tenantId]);
+            const items = rows.map(mapMenuItem);
+            const vmap = await getVariantsMap(tenantId, items.map((i) => Number(i.id)));
+            for (const it of items) it.variants = vmap.get(Number(it.id)) || [];
+            return items;
+        } catch (error) {
+            if (!isMissingColumn(error)) throw error;
+            lastError = error;
         }
-        throw error;
     }
+    throw lastError;
 }
 
 async function getCategories(tenantId) {
@@ -361,16 +357,29 @@ async function getOrders(tenantId, limit = 100) {
 router.get('/bootstrap', async (req, res) => {
     try {
         const tenantId = req.user.tenant_id;
-        const [settings, menuItems, orders, categories] = await Promise.all([
+        // Resilient bootstrap: one failing section (e.g. a Delta not yet applied
+        // on the live DB) must not 500 the whole POS. Return partial data instead.
+        const results = await Promise.allSettled([
             getSettings(tenantId),
             getMenuItems(tenantId),
             getOrders(tenantId, 200),
             getCategories(tenantId)
         ]);
+        const names = ['settings', 'menuItems', 'orders', 'categories'];
+        const fallbacks = [{}, [], [], []];
+        const data = {};
+        results.forEach((r, i) => {
+            if (r.status === 'fulfilled') {
+                data[names[i]] = r.value;
+            } else {
+                console.error(`POS bootstrap partial failure [${names[i]}]:`, r.reason && r.reason.message ? r.reason.message : r.reason);
+                data[names[i]] = fallbacks[i];
+            }
+        });
 
         res.json({
             success: true,
-            data: { settings, menuItems, orders, categories }
+            data
         });
     } catch (error) {
         console.error('POS bootstrap error:', error);
