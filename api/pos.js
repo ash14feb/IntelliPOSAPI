@@ -118,8 +118,80 @@ const mapMenuItem = (row) => ({
     image: row.image_url || '',
     category: row.category_name,
     barcode: row?.barcode || '',
-    stock: row?.stock === undefined || row?.stock === null ? 0 : Number(row.stock)
+    stock: row?.stock === undefined || row?.stock === null ? 0 : Number(row.stock),
+    mrp: row?.mrp === undefined || row?.mrp === null ? null : Number(row.mrp),
+    unit: row?.unit || 'NONE',
+    description: row?.description || '',
+    dietaryType: row?.dietary_type || 'NONE',
+    hsnSac: row?.hsn_sac || '',
+    taxRate: row?.tax_rate === undefined || row?.tax_rate === null ? 0 : Number(row.tax_rate),
+    purchasePrice: row?.purchase_price === undefined || row?.purchase_price === null ? null : Number(row.purchase_price),
+    wholesalePrice: row?.wholesale_price === undefined || row?.wholesale_price === null ? null : Number(row.wholesale_price),
+    minWholesaleQty: row?.min_wholesale_qty === undefined || row?.min_wholesale_qty === null ? null : Number(row.min_wholesale_qty),
+    portionSize: row?.portion_size || '',
+    stockInDate: row?.stock_in_date ? String(row.stock_in_date).slice(0, 10) : '',
+    lowStockAlert: row?.low_stock_alert === undefined || row?.low_stock_alert === null ? null : Number(row.low_stock_alert),
+    variants: row?.variants ? (typeof row.variants === 'string' ? safeParseVariants(row.variants) : row.variants) : []
 });
+
+const safeParseVariants = (s) => { try { const v = JSON.parse(s); return Array.isArray(v) ? v : []; } catch { return []; } };
+
+const EXTENDED_COLS = ['mrp','unit','description','dietary_type','hsn_sac','tax_rate','purchase_price','wholesale_price','min_wholesale_qty','portion_size','stock_in_date','low_stock_alert'];
+
+async function getVariantsMap(tenantId, productIds) {
+    if (!productIds.length) return new Map();
+    try {
+        const placeholders = productIds.map(() => '?').join(',');
+        const rows = await db.query(
+            `SELECT id, product_id, variant_type, variant_name, extra_price, sort_order FROM pos_product_variants WHERE tenant_id = ? AND product_id IN (${placeholders}) AND is_active = 1 ORDER BY sort_order ASC, id ASC`,
+            [tenantId, ...productIds]
+        );
+        const map = new Map();
+        for (const r of rows) {
+            const arr = map.get(r.product_id) || [];
+            arr.push({ id: String(r.id), variantType: r.variant_type, variantName: r.variant_name, extraPrice: Number(r.extra_price), sortOrder: Number(r.sort_order) });
+            map.set(r.product_id, arr);
+        }
+        return map;
+    } catch { return new Map(); }
+}
+
+async function saveVariants(tenantId, productId, variants) {
+    try {
+        await db.query('UPDATE pos_product_variants SET is_active = 0 WHERE tenant_id = ? AND product_id = ?', [tenantId, productId]);
+        if (!Array.isArray(variants)) return;
+        let i = 0;
+        for (const v of variants) {
+            if (!v || !v.variantName) continue;
+            const vt = ['SIZE','PORTION','QUANTITY','SERVING','CUSTOM'].includes(v.variantType) ? v.variantType : 'CUSTOM';
+            await db.query(
+                `INSERT INTO pos_product_variants (tenant_id, product_id, variant_type, variant_name, extra_price, sort_order, is_active) VALUES (?, ?, ?, ?, ?, ?, 1)`,
+                [tenantId, productId, vt, String(v.variantName).slice(0,150), Number(v.extraPrice || 0), i++]
+            );
+        }
+    } catch { /* variants table may not exist yet */ }
+}
+
+const sanitizeExtended = (b) => {
+    const units = ['NONE','BAG','BOX','BTL','BUC','CARATS','CARTONS','DOZENS','GMS','KG','KW'];
+    const u = String(b.unit || 'NONE').toUpperCase();
+    const diet = String(b.dietaryType || b.dietary_type || 'NONE').toUpperCase();
+    const numOrNull = (v) => (v === undefined || v === null || v === '' ? null : Number(v));
+    return {
+        mrp: numOrNull(b.mrp),
+        unit: units.includes(u) ? u : 'NONE',
+        description: b.description ? String(b.description) : null,
+        dietary_type: ['VEG','NONVEG','EGG','NONE'].includes(diet) ? diet : 'NONE',
+        hsn_sac: b.hsnSac || b.hsn_sac ? String(b.hsnSac || b.hsn_sac) : null,
+        tax_rate: Number(b.taxRate ?? b.tax_rate ?? 0) || 0,
+        purchase_price: numOrNull(b.purchasePrice ?? b.purchase_price),
+        wholesale_price: numOrNull(b.wholesalePrice ?? b.wholesale_price),
+        min_wholesale_qty: numOrNull(b.minWholesaleQty ?? b.min_wholesale_qty),
+        portion_size: b.portionSize || b.portion_size ? String(b.portionSize || b.portion_size) : null,
+        stock_in_date: b.stockInDate || b.stock_in_date ? String(b.stockInDate || b.stock_in_date).slice(0,10) : null,
+        low_stock_alert: numOrNull(b.lowStockAlert ?? b.low_stock_alert)
+    };
+};
 
 async function getSettings(tenantId) {
     try {
@@ -150,24 +222,29 @@ async function getSettings(tenantId) {
 }
 
 async function getMenuItems(tenantId) {
-    try {
-        const rows = await db.query(
-            `SELECT
+    const baseSelect = (extra) => `SELECT
                 p.id,
                 p.name,
                 p.price,
                 p.image_url,
                 p.barcode,
-                p.stock,
+                p.stock,${extra}
                 c.name AS category_name
-             FROM pos_products p
-             INNER JOIN pos_categories c ON c.id = p.category_id
-             WHERE p.tenant_id = ? AND c.tenant_id = ? AND p.is_active = 1 AND c.is_active = 1
-             ORDER BY c.sort_order ASC, c.name ASC, p.sort_order ASC, p.name ASC`,
-            [tenantId, tenantId]
-        );
+              FROM pos_products p
+              INNER JOIN pos_categories c ON c.id = p.category_id
+              WHERE p.tenant_id = ? AND c.tenant_id = ? AND p.is_active = 1 AND c.is_active = 1
+              ORDER BY c.sort_order ASC, c.name ASC, p.sort_order ASC, p.name ASC`;
+    const ext = `,
+                p.mrp, p.unit, p.description, p.dietary_type, p.hsn_sac, p.tax_rate,
+                p.purchase_price, p.wholesale_price, p.min_wholesale_qty, p.portion_size,
+                p.stock_in_date, p.low_stock_alert`;
+    try {
+        const rows = await db.query(baseSelect(ext), [tenantId, tenantId]);
 
-        return rows.map(mapMenuItem);
+        const items = rows.map(mapMenuItem);
+        const vmap = await getVariantsMap(tenantId, items.map((i) => Number(i.id)));
+        for (const it of items) it.variants = vmap.get(Number(it.id)) || [];
+        return items;
     } catch (error) {
         // Fallback for databases where Delta_002 was never applied.
         if (error && (error.code === 'ER_BAD_FIELD_ERROR' || (error.message || '').includes('Unknown column'))) {
@@ -656,6 +733,8 @@ router.post('/menu-items', async (req, res) => {
             }
         }
 
+        await persistExtended(tenantId, result.insertId, req.body);
+
         let createdRows;
         try {
             createdRows = await db.query(
@@ -691,10 +770,14 @@ router.post('/menu-items', async (req, res) => {
             }
         }
 
-        res.status(201).json({
-            success: true,
-            data: mapMenuItem(createdRows[0])
-        });
+        const created = mapMenuItem(createdRows[0]);
+        created.variants = [...((await getVariantsMap(tenantId, [Number(result.insertId)])).get(Number(result.insertId)) || [])];
+        // Re-read extended cols if Delta_004 applied (createdRows select lacked them)
+        try {
+            const er = await db.query(`SELECT mrp, unit, description, dietary_type, hsn_sac, tax_rate, purchase_price, wholesale_price, min_wholesale_qty, portion_size, stock_in_date, low_stock_alert FROM pos_products WHERE tenant_id=? AND id=?`, [tenantId, result.insertId]);
+            if (er[0]) Object.assign(created, mapMenuItem({ ...createdRows[0], ...er[0], variants: created.variants }));
+        } catch {}
+        res.status(201).json({ success: true, data: created });
     } catch (error) {
         console.error('POS create menu item error:', error);
         res.status(500).json({
@@ -703,6 +786,18 @@ router.post('/menu-items', async (req, res) => {
         });
     }
 });
+
+// Best-effort persist of Delta_004 extended fields + variants after base insert/update.
+async function persistExtended(tenantId, productId, body) {
+    try {
+        const e = sanitizeExtended(body || {});
+        await db.query(
+            `UPDATE pos_products SET mrp=?, unit=?, description=?, dietary_type=?, hsn_sac=?, tax_rate=?, purchase_price=?, wholesale_price=?, min_wholesale_qty=?, portion_size=?, stock_in_date=?, low_stock_alert=? WHERE tenant_id=? AND id=?`,
+            [e.mrp, e.unit, e.description, e.dietary_type, e.hsn_sac, e.tax_rate, e.purchase_price, e.wholesale_price, e.min_wholesale_qty, e.portion_size, e.stock_in_date, e.low_stock_alert, tenantId, productId]
+        );
+    } catch { /* Delta_004 not applied yet */ }
+    await saveVariants(tenantId, productId, body?.variants);
+}
 
 router.put('/menu-items/:id', async (req, res) => {
     try {
@@ -769,6 +864,8 @@ router.put('/menu-items/:id', async (req, res) => {
             }
         }
 
+        await persistExtended(tenantId, id, req.body);
+
         let updatedRows;
         try {
             updatedRows = await db.query(
@@ -804,10 +901,13 @@ router.put('/menu-items/:id', async (req, res) => {
             }
         }
 
-        res.json({
-            success: true,
-            data: mapMenuItem(updatedRows[0])
-        });
+        const updated = mapMenuItem(updatedRows[0]);
+        updated.variants = [...((await getVariantsMap(tenantId, [Number(id)])).get(Number(id)) || [])];
+        try {
+            const er = await db.query(`SELECT mrp, unit, description, dietary_type, hsn_sac, tax_rate, purchase_price, wholesale_price, min_wholesale_qty, portion_size, stock_in_date, low_stock_alert FROM pos_products WHERE tenant_id=? AND id=?`, [tenantId, id]);
+            if (er[0]) Object.assign(updated, mapMenuItem({ ...updatedRows[0], ...er[0], variants: updated.variants }));
+        } catch {}
+        res.json({ success: true, data: updated });
     } catch (error) {
         console.error('POS update menu item error:', error);
         res.status(500).json({
@@ -852,7 +952,10 @@ router.post('/orders', async (req, res) => {
             paymentMode,
             customerName,
             customerPhone,
-            items = []
+            items = [],
+            orderType,
+            tableId,
+            orderStatus
         } = req.body;
 
         if (!id || !Array.isArray(items) || items.length === 0) {
@@ -865,7 +968,48 @@ router.post('/orders', async (req, res) => {
 
         await connection.beginTransaction();
 
-        const [orderResult] = await connection.execute(
+        const safeOrderType = String(orderType || 'TAKEAWAY').toUpperCase() === 'DINEIN' ? 'DINEIN' : 'TAKEAWAY';
+        const safeStatus = String(orderStatus || (safeOrderType === 'DINEIN' ? 'ACTIVE' : 'COMPLETED')).toUpperCase();
+        const safeTableId = tableId ? Number(tableId) : null;
+
+        let orderResult;
+        try {
+        [orderResult] = await connection.execute(
+            `INSERT INTO pos_orders (
+                tenant_id,
+                order_code,
+                subtotal,
+                discount,
+                cgst_amount,
+                sgst_amount,
+                total_amount,
+                payment_mode,
+                customer_name,
+                customer_phone,
+                order_type,
+                order_status,
+                table_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+                tenantId,
+                id,
+                Number(subtotal || 0),
+                Number(discount || 0),
+                Number(cgst || 0),
+                Number(sgst || 0),
+                Number(total || 0),
+                paymentMode || 'CASH',
+                customerName || null,
+                customerPhone || null,
+                safeOrderType,
+                safeStatus,
+                safeTableId
+            ]
+        );
+        } catch (e) {
+            // Fallback when Delta_001 columns not applied yet.
+            if (e && (e.code === 'ER_BAD_FIELD_ERROR' || (e.message || '').includes('Unknown column'))) {
+        [orderResult] = await connection.execute(
             `INSERT INTO pos_orders (
                 tenant_id,
                 order_code,
@@ -891,6 +1035,8 @@ router.post('/orders', async (req, res) => {
                 customerPhone || null
             ]
         );
+            } else { throw e; }
+        }
 
         for (const item of items) {
             await connection.execute(
@@ -922,6 +1068,17 @@ router.post('/orders', async (req, res) => {
         await connection.commit();
         connection.release();
 
+        // Sync table status: SAVE -> OCCUPIED, PAID/COMPLETED -> FREE (best effort).
+        try {
+            if (safeTableId) {
+                if (['ACTIVE','SAVED','OCCUPIED'].includes(safeStatus)) {
+                    await db.query(`UPDATE pos_tables SET status='OCCUPIED', current_order_code=? WHERE tenant_id=? AND id=?`, [id, tenantId, safeTableId]);
+                } else if (['PAID','COMPLETED'].includes(safeStatus)) {
+                    await db.query(`UPDATE pos_tables SET status='FREE', current_order_code=NULL WHERE tenant_id=? AND id=?`, [tenantId, safeTableId]);
+                }
+            }
+        } catch {}
+
         res.status(201).json({
             success: true,
             message: 'Order saved successfully'
@@ -934,6 +1091,84 @@ router.post('/orders', async (req, res) => {
             success: false,
             message: 'Error saving order'
         });
+    }
+});
+
+// Update a dine-in order (items / totals / status) + keep table in sync.
+router.put('/orders/:orderCode', async (req, res) => {
+    const connection = await db.getConnection();
+    try {
+        const tenantId = req.user.tenant_id;
+        const { orderCode } = req.params;
+        const { items, subtotal, discount, cgst, sgst, total, paymentMode, orderStatus, tableId } = req.body;
+        await connection.beginTransaction();
+        const rows = await connection.execute('SELECT id, table_id FROM pos_orders WHERE tenant_id=? AND order_code=? LIMIT 1', [tenantId, orderCode]);
+        const order = rows[0][0];
+        if (!order) { await connection.rollback(); connection.release(); return res.status(404).json({ success: false, message: 'Order not found' }); }
+        if (items && Array.isArray(items)) {
+            await connection.execute('DELETE FROM pos_order_items WHERE tenant_id=? AND order_id=?', [tenantId, order.id]);
+            for (const item of items) {
+                await connection.execute(
+                    `INSERT INTO pos_order_items (tenant_id, order_id, product_id, item_name, item_category, item_image, quantity, unit_price, line_total) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    [tenantId, order.id, Number(item.id) || null, item.name, item.category || 'General', item.image || null, Number(item.qty ?? item.quantity ?? 0), Number(item.price || 0), Number(item.price || 0) * Number(item.qty ?? item.quantity ?? 0)]
+                );
+            }
+        }
+        const sets = [];
+        const vals = [];
+        const push = (col, v) => { sets.push(`${col}=?`); vals.push(v); };
+        if (subtotal !== undefined) push('subtotal', Number(subtotal || 0));
+        if (discount !== undefined) push('discount', Number(discount || 0));
+        if (cgst !== undefined) push('cgst_amount', Number(cgst || 0));
+        if (sgst !== undefined) push('sgst_amount', Number(sgst || 0));
+        if (total !== undefined) push('total_amount', Number(total || 0));
+        if (paymentMode) push('payment_mode', paymentMode);
+        if (orderStatus) push('order_status', String(orderStatus).toUpperCase());
+        if (tableId !== undefined) push('table_id', tableId ? Number(tableId) : null);
+        if (sets.length) { try { await connection.execute(`UPDATE pos_orders SET ${sets.join(', ')} WHERE tenant_id=? AND id=?`, [...vals, tenantId, order.id]); } catch (e) { if (!(e && (e.code === 'ER_BAD_FIELD_ERROR'))) throw e; } }
+        await connection.commit();
+        connection.release();
+        const st = String(orderStatus || '').toUpperCase();
+        const tid = tableId !== undefined ? (tableId ? Number(tableId) : null) : (order.table_id ? Number(order.table_id) : null);
+        try {
+            if (tid) {
+                if (['SERVED','ACTIVE','SAVED'].includes(st)) await db.query(`UPDATE pos_tables SET status='OCCUPIED', current_order_code=? WHERE tenant_id=? AND id=?`, [orderCode, tenantId, tid]);
+                else if (['PAID','COMPLETED'].includes(st)) await db.query(`UPDATE pos_tables SET status='FREE', current_order_code=NULL WHERE tenant_id=? AND id=?`, [tenantId, tid]);
+            }
+        } catch {}
+        res.json({ success: true });
+    } catch (error) {
+        try { await connection.rollback(); } catch {}
+        connection.release();
+        console.error('POS update order error:', error);
+        res.status(500).json({ success: false, message: 'Error updating order' });
+    }
+});
+
+// Active order for a table (with items) — powers occupied-table open.
+router.get('/tables/:tableId/active-order', async (req, res) => {
+    try {
+        const tenantId = req.user.tenant_id;
+        const tableId = Number(req.params.tableId);
+        let orderRows = [];
+        try {
+            orderRows = await db.query(`SELECT id, order_code, subtotal, discount, cgst_amount, sgst_amount, total_amount, payment_mode, customer_name, customer_phone, order_type, order_status, table_id, created_at FROM pos_orders WHERE tenant_id=? AND table_id=? AND order_status NOT IN ('PAID','COMPLETED','CANCELLED') ORDER BY created_at DESC LIMIT 1`, [tenantId, tableId]);
+        } catch (e) {
+            orderRows = await db.query(`SELECT id, order_code, subtotal, discount, cgst_amount, sgst_amount, total_amount, payment_mode, customer_name, customer_phone, created_at FROM pos_orders WHERE tenant_id=? ORDER BY created_at DESC LIMIT 1`, [tenantId]);
+        }
+        if (!orderRows.length) return res.json({ success: true, data: null });
+        const o = orderRows[0];
+        const itemRows = await db.query(`SELECT product_id, item_name, item_category, item_image, quantity, unit_price, line_total FROM pos_order_items WHERE tenant_id=? AND order_id=? ORDER BY id ASC`, [tenantId, o.id]);
+        res.json({ success: true, data: {
+            id: o.order_code, orderCode: o.order_code, subtotal: Number(o.subtotal), discount: Number(o.discount),
+            cgst: Number(o.cgst_amount), sgst: Number(o.sgst_amount), total: Number(o.total_amount),
+            paymentMode: o.payment_mode, customerName: o.customer_name, customerPhone: o.customer_phone,
+            orderType: o.order_type || 'DINEIN', orderStatus: o.order_status || 'ACTIVE', tableId,
+            items: itemRows.map((r, i) => ({ id: String(r.product_id ?? i), name: r.item_name, price: Number(r.unit_price), qty: Number(r.quantity), quantity: Number(r.quantity), category: r.item_category, image: r.item_image }))
+        }});
+    } catch (error) {
+        console.error('POS active table order error:', error);
+        res.status(500).json({ success: false, message: 'Error loading table order' });
     }
 });
 
