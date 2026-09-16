@@ -19,6 +19,8 @@ const kotRoutes = require('./api/kot');
 const customersRoutes = require('./api/customers');
 const dineOrdersRoutes = require('./api/dineorders');
 const posExpensesRoutes = require('./api/posexpenses');
+const exportRoutes = require('./api/export');
+const reviewsRoutes = require('./api/reviews');
 const app = express();
 
 // Middleware
@@ -55,6 +57,8 @@ app.use('/api/kot', kotRoutes);
 app.use('/api/customers', customersRoutes);
 app.use('/api/dineorders', dineOrdersRoutes);
 app.use('/api/posexpenses', posExpensesRoutes);
+app.use('/api/export', exportRoutes);
+app.use('/api/reviews', reviewsRoutes);
 
 // 404 handler
 app.use('*', (req, res) => {

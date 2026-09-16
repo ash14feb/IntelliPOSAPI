@@ -82,6 +82,7 @@ const DEFAULT_SETTINGS = {
     orderAfterBill: false,
     businessType: 'FOOD',
     dineInEnabled: false,
+    timezone: 'Asia/Kolkata',
     enableBarcode: false,
     enableStock: false,
     allowSaleWhenOutOfStock: true
@@ -101,6 +102,7 @@ const mapSettingsRow = (row) => ({
     orderAfterBill: Boolean(row?.order_after_bill ?? DEFAULT_SETTINGS.orderAfterBill),
     businessType: row?.business_type ?? DEFAULT_SETTINGS.businessType,
     dineInEnabled: Boolean(row?.dine_in_enabled ?? DEFAULT_SETTINGS.dineInEnabled),
+    timezone: row?.timezone || DEFAULT_SETTINGS.timezone,
     enableBarcode: Boolean(row?.enable_barcode ?? DEFAULT_SETTINGS.enableBarcode),
     enableStock: Boolean(row?.enable_stock ?? DEFAULT_SETTINGS.enableStock),
     allowSaleWhenOutOfStock: row?.allow_sale_out_of_stock === undefined || row?.allow_sale_out_of_stock === null
@@ -198,7 +200,7 @@ const sanitizeExtended = (b) => {
 async function getSettings(tenantId) {
     try {
         const rows = await db.query(
-            `SELECT restaurant_name, currency_symbol, cgst_percent, sgst_percent, tax_inclusive, enable_kot, printer_connection_type, paper_width, receipt_header, receipt_footer, order_after_bill, business_type, dine_in_enabled, enable_barcode, enable_stock, allow_sale_out_of_stock
+            `SELECT restaurant_name, currency_symbol, cgst_percent, sgst_percent, tax_inclusive, enable_kot, printer_connection_type, paper_width, receipt_header, receipt_footer, order_after_bill, business_type, dine_in_enabled, enable_barcode, enable_stock, allow_sale_out_of_stock, timezone
              FROM pos_settings
              WHERE tenant_id = ?
              LIMIT 1`,
@@ -417,6 +419,7 @@ router.put('/settings', async (req, res) => {
             orderAfterBill,
         businessType,
             dineInEnabled,
+            timezone,
             enableBarcode,
             enableStock,
             allowSaleWhenOutOfStock
@@ -462,9 +465,15 @@ router.put('/settings', async (req, res) => {
                 enable_stock = VALUES(enable_stock),
                 allow_sale_out_of_stock = VALUES(allow_sale_out_of_stock)`;
 
-        // Tiered save: full (Delta_007) -> Delta_001 level -> base.
-        // A live DB missing only dine_in_enabled must still persist business_type etc.
+        // Tiered save: full (Delta_012 incl. timezone) -> Delta_007 -> Delta_001 level -> base.
+        // A live DB missing newer columns still persists everything else.
+        const safeTimezone = typeof timezone === 'string' && timezone.length <= 60 ? timezone : 'Asia/Kolkata';
         const attempts = [
+            {
+                cols: `${d1Cols}, dine_in_enabled, timezone`,
+                vals: [...d1Vals, toDbFlag(dineInEnabled, false), safeTimezone],
+                update: `${d1Update}, dine_in_enabled = VALUES(dine_in_enabled), timezone = VALUES(timezone)`,
+            },
             {
                 cols: `${d1Cols}, dine_in_enabled`,
                 vals: [...d1Vals, toDbFlag(dineInEnabled, false)],
@@ -1181,9 +1190,13 @@ router.get('/tables/:tableId/active-order', async (req, res) => {
         const tableId = Number(req.params.tableId);
         let orderRows = [];
         try {
-            orderRows = await db.query(`SELECT id, order_code, subtotal, discount, cgst_amount, sgst_amount, total_amount, payment_mode, customer_name, customer_phone, order_type, order_status, table_id, created_at FROM pos_orders WHERE tenant_id=? AND table_id=? AND order_status NOT IN ('PAID','COMPLETED','CANCELLED') ORDER BY created_at DESC LIMIT 1`, [tenantId, tableId]);
+            orderRows = await db.query(`SELECT id, order_code, subtotal, discount, cgst_amount, sgst_amount, total_amount, payment_mode, customer_name, customer_phone, kitchen_notes, order_type, order_status, table_id, created_at FROM pos_orders WHERE tenant_id=? AND table_id=? AND order_status NOT IN ('PAID','COMPLETED','CANCELLED') ORDER BY created_at DESC LIMIT 1`, [tenantId, tableId]);
         } catch (e) {
-            orderRows = await db.query(`SELECT id, order_code, subtotal, discount, cgst_amount, sgst_amount, total_amount, payment_mode, customer_name, customer_phone, created_at FROM pos_orders WHERE tenant_id=? ORDER BY created_at DESC LIMIT 1`, [tenantId]);
+            try {
+                orderRows = await db.query(`SELECT id, order_code, subtotal, discount, cgst_amount, sgst_amount, total_amount, payment_mode, customer_name, customer_phone, order_type, order_status, table_id, created_at FROM pos_orders WHERE tenant_id=? AND table_id=? AND order_status NOT IN ('PAID','COMPLETED','CANCELLED') ORDER BY created_at DESC LIMIT 1`, [tenantId, tableId]);
+            } catch (e2) {
+                orderRows = await db.query(`SELECT id, order_code, subtotal, discount, cgst_amount, sgst_amount, total_amount, payment_mode, customer_name, customer_phone, created_at FROM pos_orders WHERE tenant_id=? ORDER BY created_at DESC LIMIT 1`, [tenantId]);
+            }
         }
         if (!orderRows.length) return res.json({ success: true, data: null });
         const o = orderRows[0];
@@ -1192,6 +1205,7 @@ router.get('/tables/:tableId/active-order', async (req, res) => {
             id: o.order_code, orderCode: o.order_code, subtotal: Number(o.subtotal), discount: Number(o.discount),
             cgst: Number(o.cgst_amount), sgst: Number(o.sgst_amount), total: Number(o.total_amount),
             paymentMode: o.payment_mode, customerName: o.customer_name, customerPhone: o.customer_phone,
+            kitchenNotes: o.kitchen_notes || '',
             orderType: o.order_type || 'DINEIN', orderStatus: o.order_status || 'ACTIVE', tableId,
             items: itemRows.map((r, i) => ({ id: String(r.product_id ?? i), name: r.item_name, price: Number(r.unit_price), qty: Number(r.quantity), quantity: Number(r.quantity), category: r.item_category, image: r.item_image }))
         }});

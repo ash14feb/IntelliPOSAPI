@@ -40,7 +40,20 @@ R4WgTg==
             },
             waitForConnections: true,
             connectionLimit: 10,
-            queueLimit: 0
+            queueLimit: 0,
+            // All datetimes are stored as UTC. Pin parsing + session to UTC so a
+            // TIMESTAMP wall clock is never re-interpreted in the host's local
+            // zone (that shifted every instant by the host UTC offset, e.g. -5:30
+            // on an IST machine, making 05:33 UTC display as 05:33 IST).
+            timezone: 'Z',
+            dateStrings: false
+        });
+
+        // Force every pooled MySQL session to UTC as well.
+        this.pool.on('connection', (conn) => {
+            conn.query("SET time_zone = '+00:00'", (err) => {
+                if (err) console.error('Failed to set session time_zone:', err.message);
+            });
         });
 
         // For debugging

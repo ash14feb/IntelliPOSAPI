@@ -13,7 +13,7 @@ async function getPublicActiveOrder(table) {
         const st = String(table.status || '').toUpperCase();
         if ((st !== 'CUSTOMER_ORDERED' && st !== 'HAVING_FOOD') || !table.current_order_code) return null;
         const orows = await db.query(
-            `SELECT id, order_code, subtotal, total_amount, customer_name, order_status FROM pos_orders WHERE tenant_id=? AND order_code=? LIMIT 1`,
+            `SELECT id, order_code, subtotal, total_amount, customer_name, customer_phone, kitchen_notes, order_status FROM pos_orders WHERE tenant_id=? AND order_code=? LIMIT 1`,
             [table.tenant_id, table.current_order_code]
         );
         if (!orows.length) return null;
@@ -23,10 +23,25 @@ async function getPublicActiveOrder(table) {
             `SELECT item_name, quantity, unit_price, line_total FROM pos_order_items WHERE tenant_id=? AND order_id=? ORDER BY id ASC`,
             [table.tenant_id, o.id]
         );
+        // Existing review for this order (if the customer already rated).
+        let myReview = null;
+        try {
+            const rrows = await db.query(`SELECT id, overall_rating, review_text FROM pos_reviews WHERE tenant_id=? AND order_code=? LIMIT 1`, [table.tenant_id, o.order_code]);
+            if (rrows.length) {
+                const items = await db.query(`SELECT item_name, rating FROM pos_review_items WHERE tenant_id=? AND review_id=? ORDER BY id ASC`, [table.tenant_id, rrows[0].id]);
+                myReview = {
+                    overallRating: Number(rrows[0].overall_rating || 0),
+                    reviewText: rrows[0].review_text || '',
+                    items: items.map((it) => ({ name: it.item_name, rating: Number(it.rating || 0) })),
+                };
+            }
+        } catch {}
         return {
             orderCode: o.order_code,
             orderStatus: o.order_status,
             customerName: o.customer_name || '',
+            customerPhone: o.customer_phone || '',
+            kitchenNotes: o.kitchen_notes || '',
             subtotal: Number(o.subtotal || 0),
             total: Number(o.total_amount ?? o.subtotal ?? 0),
             items: irows.map((r) => ({
@@ -35,6 +50,7 @@ async function getPublicActiveOrder(table) {
                 price: Number(r.unit_price || 0),
                 lineTotal: Number(r.line_total ?? (Number(r.unit_price || 0) * Number(r.quantity || 0))),
             })),
+            myReview,
         };
     } catch { return null; }
 }
@@ -119,13 +135,14 @@ router.post('/order/:code', async (req, res) => {
         if (!(await ensureMenuCodeColumn())) {
             return res.status(500).json({ success: false, message: 'Table ordering is not set up yet' });
         }
-        const { items, customerName, customerPhone } = req.body || {};
+        const { items, customerName, customerPhone, kitchenNotes } = req.body || {};
         if (!customerName || !String(customerName).trim()) {
             return res.status(400).json({ success: false, message: 'Name is required' });
         }
         if (!customerPhone || !String(customerPhone).trim()) {
             return res.status(400).json({ success: false, message: 'Phone number is required' });
         }
+        const notes = kitchenNotes ? String(kitchenNotes).slice(0, 500) : '';
         if (!Array.isArray(items) || items.length === 0) {
             return res.status(400).json({ success: false, message: 'Select at least one item' });
         }
@@ -164,7 +181,7 @@ router.post('/order/:code', async (req, res) => {
             try {
                 await connection.beginTransaction();
                 const orows = await connection.execute(
-                    `SELECT id, subtotal, total_amount, order_status FROM pos_orders WHERE tenant_id=? AND order_code=? LIMIT 1`,
+                    `SELECT id, subtotal, total_amount, order_status, kitchen_notes FROM pos_orders WHERE tenant_id=? AND order_code=? LIMIT 1`,
                     [table.tenant_id, existingOrderCode]
                 );
                 const orow = (orows[0] && orows[0][0]) || null;
@@ -184,7 +201,16 @@ router.post('/order/:code', async (req, res) => {
                 const newTotal = Number(orow.total_amount || 0) + subtotal;
                 // New items need serving again -> flip order back to ACTIVE so
                 // swipe-to-serve re-enables in Tables/POS.
-                await connection.execute(`UPDATE pos_orders SET subtotal=?, total_amount=?, order_status='ACTIVE' WHERE tenant_id=? AND id=?`, [newSubtotal, newTotal, table.tenant_id, orow.id]);
+                let mergedNotes = String(orow.kitchen_notes || '');
+                if (notes) mergedNotes = mergedNotes ? `${mergedNotes} | ${notes}`.slice(0, 500) : notes;
+                try {
+                    await connection.execute(`UPDATE pos_orders SET subtotal=?, total_amount=?, order_status='ACTIVE', kitchen_notes=? WHERE tenant_id=? AND id=?`, [newSubtotal, newTotal, mergedNotes || null, table.tenant_id, orow.id]);
+                } catch (e) {
+                    // Delta_011 not applied yet: no kitchen_notes column.
+                    if (e && (e.code === 'ER_BAD_FIELD_ERROR' || e.errno === 1054)) {
+                        await connection.execute(`UPDATE pos_orders SET subtotal=?, total_amount=?, order_status='ACTIVE' WHERE tenant_id=? AND id=?`, [newSubtotal, newTotal, table.tenant_id, orow.id]);
+                    } else { throw e; }
+                }
                 // Re-order flips the table back to CUSTOMER_ORDERED (needs staff attention again).
                 try {
                     await connection.execute(`UPDATE pos_tables SET status='CUSTOMER_ORDERED', current_order_code=? WHERE tenant_id=? AND id=?`, [existingOrderCode, table.tenant_id, table.id]);
@@ -210,9 +236,9 @@ router.post('/order/:code', async (req, res) => {
             await connection.beginTransaction();
             let orderResult;
             const publicInsert = (mode) => connection.execute(
-                `INSERT INTO pos_orders (tenant_id, order_code, subtotal, discount, cgst_amount, sgst_amount, total_amount, payment_mode, customer_name, customer_phone, order_type, order_status, table_id)
-                 VALUES (?, ?, ?, 0, 0, 0, ?, '${mode}', ?, ?, 'DINEIN', 'ACTIVE', ?)`,
-                [table.tenant_id, orderCode, subtotal, subtotal, String(customerName).trim(), String(customerPhone).trim(), table.id]
+                `INSERT INTO pos_orders (tenant_id, order_code, subtotal, discount, cgst_amount, sgst_amount, total_amount, payment_mode, customer_name, customer_phone, kitchen_notes, order_type, order_status, table_id)
+                 VALUES (?, ?, ?, 0, 0, 0, ?, '${mode}', ?, ?, ?, 'DINEIN', 'ACTIVE', ?)`,
+                [table.tenant_id, orderCode, subtotal, subtotal, String(customerName).trim(), String(customerPhone).trim(), notes || null, table.id]
             );
             try {
                 try {
@@ -222,6 +248,20 @@ router.post('/order/:code', async (req, res) => {
                     if (e && (e.errno === 1265 || e.code === 'WARN_DATA_TRUNCATED' || (e.message || '').includes('payment_mode'))) {
                         console.warn('Public order saved as CASH (Delta_010 not applied).');
                         [orderResult] = await publicInsert('CASH');
+                    } else if (e && (e.code === 'ER_BAD_FIELD_ERROR' || e.errno === 1054)) {
+                        // Delta_011 not applied yet: no kitchen_notes column.
+                        const fallback = (m) => connection.execute(
+                            `INSERT INTO pos_orders (tenant_id, order_code, subtotal, discount, cgst_amount, sgst_amount, total_amount, payment_mode, customer_name, customer_phone, order_type, order_status, table_id)
+                             VALUES (?, ?, ?, 0, 0, 0, ?, '${m}', ?, ?, 'DINEIN', 'ACTIVE', ?)`,
+                            [table.tenant_id, orderCode, subtotal, subtotal, String(customerName).trim(), String(customerPhone).trim(), table.id]
+                        );
+                        try {
+                            [orderResult] = await fallback('PENDING');
+                        } catch (e2) {
+                            if (e2 && (e2.errno === 1265 || e2.code === 'WARN_DATA_TRUNCATED' || (e2.message || '').includes('payment_mode'))) {
+                                [orderResult] = await fallback('CASH');
+                            } else { throw e2; }
+                        }
                     } else { throw e; }
                 }
             } catch (e) {
@@ -261,6 +301,67 @@ router.post('/order/:code', async (req, res) => {
     } catch (e) {
         console.error('Public table order error:', e);
         res.status(500).json({ success: false, message: 'Could not place order' });
+    }
+});
+
+// ---- Public rating/review submit from a table QR menu (no auth) ----
+// Body: { overallRating (1-5, required), reviewText (max 250), itemRatings: [{name, rating}] }
+// Allowed only while the table is HAVING_FOOD with a live order. One review per
+// order — resubmitting updates the previous review.
+router.post('/review/:code', async (req, res) => {
+    try {
+        const { overallRating, reviewText, itemRatings } = req.body || {};
+        const overall = Math.max(1, Math.min(5, Number(overallRating) || 0));
+        if (!overall) return res.status(400).json({ success: false, message: 'Please give an overall rating' });
+        const text = reviewText ? String(reviewText).slice(0, 250) : '';
+        const tables = await db.query(
+            'SELECT id, tenant_id, table_no, status, current_order_code FROM pos_tables WHERE menu_code = ? AND is_active = 1 LIMIT 1',
+            [req.params.code]
+        );
+        if (!tables.length) return res.status(404).json({ success: false, message: 'Table link not found' });
+        const table = tables[0];
+        if (String(table.status || '').toUpperCase() !== 'HAVING_FOOD' || !table.current_order_code) {
+            return res.status(400).json({ success: false, message: 'Reviews open after your food is served' });
+        }
+        const orows = await db.query(`SELECT id, customer_name, customer_phone FROM pos_orders WHERE tenant_id=? AND order_code=? LIMIT 1`, [table.tenant_id, table.current_order_code]);
+        if (!orows.length) return res.status(400).json({ success: false, message: 'Order not found' });
+        const ord = orows[0];
+        const cleanItems = Array.isArray(itemRatings)
+            ? itemRatings
+                .map((r) => ({ name: String(r.name || '').slice(0, 200), rating: Math.max(1, Math.min(5, Number(r.rating) || 0)) }))
+                .filter((r) => r.name && r.rating)
+                .slice(0, 100)
+            : [];
+        const connection = await db.getConnection();
+        try {
+            await connection.beginTransaction();
+            const existing = await connection.execute(`SELECT id FROM pos_reviews WHERE tenant_id=? AND order_code=? LIMIT 1`, [table.tenant_id, table.current_order_code]);
+            let reviewId = existing[0] && existing[0][0] ? existing[0][0].id : null;
+            if (reviewId) {
+                await connection.execute(`UPDATE pos_reviews SET overall_rating=?, review_text=?, customer_name=?, customer_phone=? WHERE tenant_id=? AND id=?`, [overall, text || null, ord.customer_name || null, ord.customer_phone || null, table.tenant_id, reviewId]);
+                await connection.execute(`DELETE FROM pos_review_items WHERE tenant_id=? AND review_id=?`, [table.tenant_id, reviewId]);
+            } else {
+                const [result] = await connection.execute(
+                    `INSERT INTO pos_reviews (tenant_id, order_id, order_code, table_id, customer_name, customer_phone, overall_rating, review_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                    [table.tenant_id, ord.id, table.current_order_code, table.id, ord.customer_name || null, ord.customer_phone || null, overall, text || null]
+                );
+                reviewId = result.insertId;
+            }
+            for (const it of cleanItems) {
+                await connection.execute(`INSERT INTO pos_review_items (tenant_id, review_id, item_name, rating) VALUES (?, ?, ?, ?)`, [table.tenant_id, reviewId, it.name, it.rating]);
+            }
+            await connection.commit();
+            connection.release();
+        } catch (e) {
+            try { await connection.rollback(); } catch {}
+            connection.release();
+            throw e;
+        }
+        res.status(201).json({ success: true, message: 'Thank you for your feedback!' });
+    } catch (e) {
+        console.error('Public review error:', e);
+        const msg = (e && (e.code === 'ER_NO_SUCH_TABLE' || e.errno === 1146)) ? 'Reviews are not set up yet' : 'Could not save review';
+        res.status(500).json({ success: false, message: msg });
     }
 });
 
