@@ -897,4 +897,106 @@ router.post('/reset-password', async (req, res) => {
     }
 });
 
+router.post('/google', async (req, res) => {
+    try {
+        const { idToken } = req.body;
+        if (!idToken) {
+            return res.status(400).json({ success: false, message: 'Google ID token is required' });
+        }
+        // Verify the ID token with Google (no extra dependency).
+        const verifyRes = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`);
+        if (!verifyRes.ok) {
+            return res.status(401).json({ success: false, message: 'Invalid Google token' });
+        }
+        const payload = await verifyRes.json();
+        const allowedClientIds = [process.env.GOOGLE_CLIENT_ID, process.env.VITE_GOOGLE_CLIENT_ID].filter(Boolean);
+        if (allowedClientIds.length > 0 && payload.aud && !allowedClientIds.includes(payload.aud)) {
+            return res.status(401).json({ success: false, message: 'Google token audience mismatch' });
+        }
+        if (payload.email_verified !== 'true' && payload.email_verified !== true) {
+            return res.status(401).json({ success: false, message: 'Google email not verified' });
+        }
+        const email = String(payload.email || '').trim().toLowerCase();
+        if (!email) {
+            return res.status(401).json({ success: false, message: 'Google account has no email' });
+        }
+        const users = await db.query('SELECT * FROM users WHERE email = ? AND is_active = 1 LIMIT 1', [email]);
+        if (!users || users.length === 0) {
+            // No POS account yet — auto-register a new business if the
+            // client supplied one (Google sign-up flow).
+            const businessName = String(req.body.businessName || req.body.business_name || '').trim();
+            if (!businessName) {
+                return res.status(403).json({
+                    success: false,
+                    code: 'NEED_REGISTER',
+                    message: 'No POS account found for this Google email. Please register your business first.'
+                });
+            }
+            const existingTenant = await db.query(
+                'SELECT tenant_id FROM pos_tenants WHERE owner_email = ? LIMIT 1',
+                [email]
+            );
+            if (existingTenant.length > 0) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'A store is already registered with this email address. Please sign in instead.'
+                });
+            }
+            const fullName = String(req.body.name || payload.name || 'Google User').trim();
+            const passwordHash = await bcrypt.hash(generatePassword() + Date.now(), 10);
+            const connection = await db.getConnection();
+            try {
+                await connection.beginTransaction();
+                const [tenantResult] = await connection.execute(
+                    `INSERT INTO pos_tenants (business_name, owner_name, owner_email) VALUES (?, ?, ?)`,
+                    [businessName, fullName, email]
+                );
+                const tenantId = tenantResult.insertId;
+                const username = await ensureUniqueUsername(buildStoreAdminUsername(businessName, tenantId));
+                await connection.execute(
+                    `INSERT INTO users (tenant_id, username, email, password_hash, full_name, user_type, assigned_store, is_active)
+                     VALUES (?, ?, ?, ?, ?, 'admin', 'all', 1)`,
+                    [tenantId, username, email, passwordHash, fullName]
+                );
+                await connection.execute(
+                    `INSERT INTO pos_settings (
+                        tenant_id, restaurant_name, currency_symbol, cgst_percent, sgst_percent,
+                        tax_inclusive, enable_kot, printer_connection_type, paper_width,
+                        receipt_header, receipt_footer
+                    ) VALUES (?, ?, 'Rs.', 2.50, 2.50, 0, 1, 'bluetooth', '3inch', 'Welcome to Scanex!', 'Thank you for visiting!')`,
+                    [tenantId, businessName]
+                );
+                await connection.commit();
+                connection.release();
+                const created = await db.query(
+                    'SELECT * FROM users WHERE tenant_id = ? AND email = ? LIMIT 1',
+                    [tenantId, email]
+                );
+                const { password_hash, ...newUser } = created[0];
+                return res.status(201).json({
+                    success: true,
+                    message: 'Business registered with Google successfully',
+                    token: signAuthToken(newUser),
+                    user: newUser
+                });
+            } catch (txErr) {
+                await connection.rollback();
+                connection.release();
+                throw txErr;
+            }
+        }
+        const user = users[0];
+        const { password_hash, ...userWithoutPassword } = user;
+        res.json({
+            success: true,
+            message: 'Google login successful',
+            token: signAuthToken(userWithoutPassword),
+            user: userWithoutPassword
+        });
+    } catch (error) {
+        console.error('Google login error:', error);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
 module.exports = router;
