@@ -402,7 +402,7 @@ router.get('/bootstrap', async (req, res) => {
     }
 });
 
-router.put('/settings', async (req, res) => {
+router.put('/settings', authorize('admin', 'super_admin'), async (req, res) => {
     try {
         const tenantId = req.user.tenant_id;
         const {

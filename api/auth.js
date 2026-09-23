@@ -346,11 +346,11 @@ router.post('/create-user', authMiddleware, authorize('admin'), async (req, res)
             });
         }
 
-        const validUserTypes = ['manager', 'staff'];
+        const validUserTypes = ['manager', 'staff', 'kitchen', 'captain'];
         if (!validUserTypes.includes(user_type)) {
             return res.status(400).json({
                 success: false,
-                message: 'user_type must be one of: manager, staff'
+                message: 'user_type must be one of: manager, staff, kitchen, captain'
             });
         }
 
@@ -508,11 +508,11 @@ router.put('/users/:id', authMiddleware, authorize('admin'), async (req, res) =>
         }
 
         if (user_type !== undefined) {
-            const validUserTypes = ['manager', 'staff'];
+            const validUserTypes = ['manager', 'staff', 'kitchen', 'captain'];
             if (!validUserTypes.includes(user_type)) {
                 return res.status(400).json({
                     success: false,
-                    message: 'user_type must be one of: manager, staff'
+                    message: 'user_type must be one of: manager, staff, kitchen, captain'
                 });
             }
             updates.push('user_type = ?');
