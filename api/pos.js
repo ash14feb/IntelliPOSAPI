@@ -135,6 +135,8 @@ const mapMenuItem = (row) => ({
     portionSize: row?.portion_size || '',
     stockInDate: row?.stock_in_date ? String(row.stock_in_date).slice(0, 10) : '',
     lowStockAlert: row?.low_stock_alert === undefined || row?.low_stock_alert === null ? null : Number(row.low_stock_alert),
+    isAvailable: row?.is_available === undefined || row?.is_available === null ? true : Number(row.is_available) !== 0,
+    spiceLevel: row?.spice_level === undefined || row?.spice_level === null ? 0 : Math.max(0, Math.min(3, Number(row.spice_level) || 0)),
     variants: row?.variants ? (typeof row.variants === 'string' ? safeParseVariants(row.variants) : row.variants) : []
 });
 
@@ -239,6 +241,13 @@ async function getMenuItems(tenantId) {
     // Tier order matters: live DBs may have Delta_002 (barcode/stock) but not Delta_004 (extended).
     // Each fragment supplies the comma(s) around itself: `p.image_url<extra> c.name ...`.
     const tiers = [
+        `,
+                p.barcode,
+                p.stock,
+                p.mrp, p.unit, p.description, p.dietary_type, p.hsn_sac, p.tax_rate,
+                p.purchase_price, p.wholesale_price, p.min_wholesale_qty, p.portion_size,
+                p.stock_in_date, p.low_stock_alert,
+                p.is_available, p.spice_level,`,
         `,
                 p.barcode,
                 p.stock,
@@ -366,6 +375,45 @@ async function getOrders(tenantId, limit = 100) {
     }));
 }
 
+// Today's Recommended picks (Delta_014). Bulk-replace per tenant.
+router.get('/recommended', async (req, res) => {
+    try {
+        res.json({ success: true, data: await getRecommended(req.user.tenant_id) });
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'Error fetching recommended items' });
+    }
+});
+
+router.put('/recommended', async (req, res) => {
+    const connection = await db.getConnection();
+    try {
+        const tenantId = req.user.tenant_id;
+        const items = Array.isArray(req.body?.items) ? req.body.items : null;
+        if (!items) { connection.release(); return res.status(400).json({ success: false, message: 'items array required' }); }
+        await connection.beginTransaction();
+        await connection.execute('DELETE FROM pos_recommended_items WHERE tenant_id = ?', [tenantId]);
+        let i = 0;
+        for (const it of items) {
+            if (!it || !it.product_id) continue;
+            await connection.execute(
+                'INSERT INTO pos_recommended_items (tenant_id, product_id, price_delta, sort_order) VALUES (?, ?, ?, ?)',
+                [tenantId, it.product_id, Number(it.price_delta || 0), Number(it.sort_order ?? i)]
+            );
+            i++;
+        }
+        await connection.commit();
+        connection.release();
+        res.json({ success: true, data: await getRecommended(tenantId) });
+    } catch (error) {
+        try { await connection.rollback(); } catch {}
+        connection.release();
+        if (error && (error.code === 'ER_NO_SUCH_TABLE' || error.errno === 1146 || (error.message || '').includes("doesn't exist"))) {
+            return res.status(400).json({ success: false, message: 'Please run Delta_014 on the database first' });
+        }
+        res.status(500).json({ success: false, message: 'Error saving recommended items' });
+    }
+});
+
 router.get('/bootstrap', async (req, res) => {
     try {
         const tenantId = req.user.tenant_id;
@@ -375,10 +423,11 @@ router.get('/bootstrap', async (req, res) => {
             getSettings(tenantId),
             getMenuItems(tenantId),
             getOrders(tenantId, 200),
-            getCategories(tenantId)
+            getCategories(tenantId),
+            getRecommended(tenantId)
         ]);
-        const names = ['settings', 'menuItems', 'orders', 'categories'];
-        const fallbacks = [{}, [], [], []];
+        const names = ['settings', 'menuItems', 'orders', 'categories', 'recommended'];
+        const fallbacks = [{}, [], [], [], []];
         const data = {};
         results.forEach((r, i) => {
             if (r.status === 'fulfilled') {
@@ -751,6 +800,7 @@ router.post('/menu-items', async (req, res) => {
         }
 
         await persistExtended(tenantId, result.insertId, req.body);
+        await persistAvailability(tenantId, result.insertId, req.body);
 
         let createdRows;
         try {
@@ -794,6 +844,13 @@ router.post('/menu-items', async (req, res) => {
             const er = await db.query(`SELECT mrp, unit, description, dietary_type, hsn_sac, tax_rate, purchase_price, wholesale_price, min_wholesale_qty, portion_size, stock_in_date, low_stock_alert FROM pos_products WHERE tenant_id=? AND id=?`, [tenantId, result.insertId]);
             if (er[0]) Object.assign(created, mapMenuItem({ ...createdRows[0], ...er[0], variants: created.variants }));
         } catch {}
+        try {
+            const ar = await db.query(`SELECT is_available, spice_level FROM pos_products WHERE tenant_id=? AND id=?`, [tenantId, result.insertId]);
+            if (ar[0]) {
+                if (ar[0].is_available !== undefined && ar[0].is_available !== null) created.isAvailable = Number(ar[0].is_available) !== 0;
+                if (ar[0].spice_level !== undefined && ar[0].spice_level !== null) created.spiceLevel = Number(ar[0].spice_level) || 0;
+            }
+        } catch {}
         res.status(201).json({ success: true, data: created });
     } catch (error) {
         console.error('POS create menu item error:', error);
@@ -803,6 +860,52 @@ router.post('/menu-items', async (req, res) => {
         });
     }
 });
+
+// Best-effort persist of Delta_014 availability + spice level after base insert/update.
+async function persistAvailability(tenantId, productId, body) {
+    try {
+        const b = body || {};
+        const sets = [];
+        const vals = [];
+        if (b.isAvailable !== undefined) { sets.push('is_available = ?'); vals.push(b.isAvailable ? 1 : 0); }
+        if (b.is_available !== undefined && b.isAvailable === undefined) { sets.push('is_available = ?'); vals.push(b.is_available ? 1 : 0); }
+        if (b.spiceLevel !== undefined || b.spice_level !== undefined) {
+            const s = Number(b.spiceLevel ?? b.spice_level ?? 0) || 0;
+            sets.push('spice_level = ?'); vals.push(Math.max(0, Math.min(3, s)));
+        }
+        if (!sets.length) return;
+        await db.query(`UPDATE pos_products SET ${sets.join(', ')} WHERE tenant_id = ? AND id = ?`, [...vals, tenantId, productId]);
+    } catch { /* Delta_014 not applied yet */ }
+}
+
+// Recommended items (Delta_014). price_delta adds to base price (negative = discount).
+async function getRecommended(tenantId) {
+    try {
+        const rows = await db.query(
+            `SELECT r.product_id, r.price_delta, r.sort_order,
+                    p.name, p.price, p.image_url, c.name AS category_name,
+                    p.description, p.spice_level, p.is_available
+             FROM pos_recommended_items r
+             INNER JOIN pos_products p ON p.id = r.product_id AND p.tenant_id = r.tenant_id AND p.is_active = 1
+             LEFT JOIN pos_categories c ON c.id = p.category_id AND c.tenant_id = r.tenant_id
+             WHERE r.tenant_id = ?
+             ORDER BY r.sort_order ASC, r.id ASC`,
+            [tenantId]
+        );
+        return rows.map((row) => ({
+            productId: String(row.product_id),
+            name: row.name,
+            basePrice: Number(row.price),
+            priceDelta: Number(row.price_delta) || 0,
+            finalPrice: Number(row.price) + (Number(row.price_delta) || 0),
+            image: row.image_url || '',
+            category: row.category_name || 'General',
+            description: row.description || '',
+            spiceLevel: row.spice_level === undefined || row.spice_level === null ? 0 : Number(row.spice_level) || 0,
+            isAvailable: row.is_available === undefined || row.is_available === null ? true : Number(row.is_available) !== 0,
+        }));
+    } catch { return []; /* Delta_014 table not created yet */ }
+}
 
 // Best-effort persist of Delta_004 extended fields + variants after base insert/update.
 async function persistExtended(tenantId, productId, body) {
@@ -882,6 +985,7 @@ router.put('/menu-items/:id', async (req, res) => {
         }
 
         await persistExtended(tenantId, id, req.body);
+        await persistAvailability(tenantId, id, req.body);
 
         let updatedRows;
         try {

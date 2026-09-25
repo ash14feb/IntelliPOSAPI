@@ -91,17 +91,41 @@ router.get('/menu/:code', async (req, res) => {
 
         let items = [];
         try {
-            items = await db.query(
-                `SELECT p.id, p.name, p.price, p.image_url, c.name AS category_name
+            // Tier 1: with Delta_004 (description) + Delta_014 (availability, spice).
+            // Falls back gracefully when a delta hasn't been applied yet.
+            const base = (extra) => `SELECT p.id, p.name, p.price, p.image_url${extra} c.name AS category_name
                  FROM pos_products p
                  INNER JOIN pos_categories c ON c.id = p.category_id
                  WHERE p.tenant_id = ? AND c.tenant_id = ? AND p.is_active = 1 AND c.is_active = 1
-                 ORDER BY c.sort_order ASC, c.name ASC, p.sort_order ASC, p.name ASC`,
-                [table.tenant_id, table.tenant_id]
-            );
+                 ORDER BY c.sort_order ASC, c.name ASC, p.sort_order ASC, p.name ASC`;
+            try {
+                items = await db.query(base(`, p.description, p.is_available, p.spice_level,`), [table.tenant_id, table.tenant_id]);
+            } catch (e1) {
+                try {
+                    items = await db.query(base(`, p.description,`), [table.tenant_id, table.tenant_id]);
+                } catch (e2) {
+                    items = await db.query(base(`,`), [table.tenant_id, table.tenant_id]);
+                }
+            }
         } catch (e) {
             return res.status(500).json({ success: false, message: 'Error loading menu' });
         }
+
+        let recommended = [];
+        try {
+            const rrows = await db.query(
+                `SELECT r.product_id, r.price_delta, r.sort_order
+                 FROM pos_recommended_items r
+                 INNER JOIN pos_products p ON p.id = r.product_id AND p.tenant_id = r.tenant_id AND p.is_active = 1
+                 WHERE r.tenant_id = ?
+                 ORDER BY r.sort_order ASC, r.id ASC`,
+                [table.tenant_id]
+            );
+            recommended = rrows.map((r) => ({
+                productId: String(r.product_id),
+                priceDelta: Number(r.price_delta) || 0,
+            }));
+        } catch (e) { /* Delta_014 not applied yet -> no recommended section */ }
 
         res.json({
             success: true,
@@ -111,12 +135,16 @@ router.get('/menu/:code', async (req, res) => {
                 currencySymbol: settings?.currency_symbol || 'Rs.',
                 tableStatus: table.status,
                 activeOrder: await getPublicActiveOrder(table),
+                recommended,
                 menuItems: items.map(r => ({
                     id: String(r.id),
                     name: r.name,
                     price: Number(r.price),
                     image: r.image_url || '',
-                    category: r.category_name
+                    category: r.category_name,
+                    description: r.description || '',
+                    isAvailable: r.is_available === undefined || r.is_available === null ? true : Number(r.is_available) !== 0,
+                    spiceLevel: r.spice_level === undefined || r.spice_level === null ? 0 : Number(r.spice_level) || 0
                 }))
             }
         });
