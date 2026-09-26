@@ -6,6 +6,12 @@ const router = express.Router();
 
 const newMenuCode = () => crypto.randomBytes(8).toString('hex');
 
+// Reserved table_no for delivery/online ordering. Its public menu hides the
+// table name, requires GPS + address, and every order is a fresh ONLINE order
+// (never merged into a shared tab, never flips table status).
+const ONLINE_TABLE_NO = 'ONLINETABLE';
+const isOnlineTable = (table) => String(table?.table_no || '').trim().toUpperCase() === ONLINE_TABLE_NO;
+
 // Active (unpaid) order summary for a table — shown on the public menu so the
 // customer sees what was already ordered + the running total.
 async function getPublicActiveOrder(table) {
@@ -131,6 +137,7 @@ router.get('/menu/:code', async (req, res) => {
             success: true,
             data: {
                 table: { table_no: table.table_no, seats: table.seats, status: table.status, current_order_code: table.current_order_code || null },
+                isOnlineTable: isOnlineTable(table),
                 restaurantName: settings?.restaurant_name || 'Our Menu',
                 currencySymbol: settings?.currency_symbol || 'Rs.',
                 tableStatus: table.status,
@@ -164,7 +171,7 @@ router.post('/order/:code', async (req, res) => {
         if (!(await ensureMenuCodeColumn())) {
             return res.status(500).json({ success: false, message: 'Table ordering is not set up yet' });
         }
-        const { items, customerName, customerPhone, kitchenNotes } = req.body || {};
+        const { items, customerName, customerPhone, kitchenNotes, customerAddress, customerLandmark, lat, lng } = req.body || {};
         if (!customerName || !String(customerName).trim()) {
             return res.status(400).json({ success: false, message: 'Name is required' });
         }
@@ -183,11 +190,33 @@ router.post('/order/:code', async (req, res) => {
             return res.status(404).json({ success: false, message: 'Table link not found' });
         }
         const table = tables[0];
+        const onlineMode = isOnlineTable(table);
+        // Online orders: address + live GPS are mandatory (validated here too,
+        // the public menu validates before sending).
+        let onlineLoc = null;
+        if (onlineMode) {
+            const address = customerAddress ? String(customerAddress).trim().slice(0, 500) : '';
+            const alat = Number(lat);
+            const alng = Number(lng);
+            if (!address) {
+                return res.status(400).json({ success: false, message: 'Delivery address is required' });
+            }
+            if (!Number.isFinite(alat) || !Number.isFinite(alng) || alat === 0 || alng === 0) {
+                return res.status(400).json({ success: false, message: 'Location is required — please enable GPS and try again' });
+            }
+            onlineLoc = {
+                address,
+                landmark: customerLandmark ? String(customerLandmark).trim().slice(0, 255) : null,
+                lat: alat,
+                lng: alng,
+            };
+        }
         const tableStatus = String(table.status || 'FREE').toUpperCase();
         const existingOrderCode = table.current_order_code || null;
         // Re-order flow: CUSTOMER_ORDERED or HAVING_FOOD with a live order ->
         // append items and flip status back to CUSTOMER_ORDERED.
-        const isAppendFlow = (tableStatus === 'CUSTOMER_ORDERED' || tableStatus === 'HAVING_FOOD') && existingOrderCode;
+        // (Never for the shared ONLINETABLE — every online order is fresh.)
+        const isAppendFlow = !onlineMode && (tableStatus === 'CUSTOMER_ORDERED' || tableStatus === 'HAVING_FOOD') && existingOrderCode;
 
         const cleanItems = items
             .map((it) => ({
@@ -255,10 +284,11 @@ router.post('/order/:code', async (req, res) => {
                 throw e;
             }
         }
-        if (tableStatus !== 'FREE') {
+        if (!onlineMode && tableStatus !== 'FREE') {
             return res.status(400).json({ success: false, message: 'This table already has an active order' });
         }
-        const orderCode = `WEB-${Date.now()}`;
+        const orderCode = onlineMode ? `ONL-${Date.now()}` : `WEB-${Date.now()}`;
+        const orderType = onlineMode ? 'ONLINE' : 'DINEIN';
 
         const connection = await db.getConnection();
         try {
@@ -266,7 +296,7 @@ router.post('/order/:code', async (req, res) => {
             let orderResult;
             const publicInsert = (mode) => connection.execute(
                 `INSERT INTO pos_orders (tenant_id, order_code, subtotal, discount, cgst_amount, sgst_amount, total_amount, payment_mode, customer_name, customer_phone, kitchen_notes, order_type, order_status, table_id)
-                 VALUES (?, ?, ?, 0, 0, 0, ?, '${mode}', ?, ?, ?, 'DINEIN', 'ACTIVE', ?)`,
+                 VALUES (?, ?, ?, 0, 0, 0, ?, '${mode}', ?, ?, ?, '${orderType}', 'ACTIVE', ?)`,
                 [table.tenant_id, orderCode, subtotal, subtotal, String(customerName).trim(), String(customerPhone).trim(), notes || null, table.id]
             );
             try {
@@ -281,7 +311,7 @@ router.post('/order/:code', async (req, res) => {
                         // Delta_011 not applied yet: no kitchen_notes column.
                         const fallback = (m) => connection.execute(
                             `INSERT INTO pos_orders (tenant_id, order_code, subtotal, discount, cgst_amount, sgst_amount, total_amount, payment_mode, customer_name, customer_phone, order_type, order_status, table_id)
-                             VALUES (?, ?, ?, 0, 0, 0, ?, '${m}', ?, ?, 'DINEIN', 'ACTIVE', ?)`,
+                             VALUES (?, ?, ?, 0, 0, 0, ?, '${m}', ?, ?, '${orderType}', 'ACTIVE', ?)`,
                             [table.tenant_id, orderCode, subtotal, subtotal, String(customerName).trim(), String(customerPhone).trim(), table.id]
                         );
                         try {
@@ -303,6 +333,15 @@ router.post('/order/:code', async (req, res) => {
                     );
                 } else { throw e; }
             }
+            // Online delivery location (Delta_016; best-effort).
+            if (onlineMode && onlineLoc) {
+                try {
+                    await connection.execute(
+                        `UPDATE pos_orders SET customer_address=?, customer_landmark=?, customer_lat=?, customer_lng=? WHERE tenant_id=? AND id=?`,
+                        [onlineLoc.address, onlineLoc.landmark, onlineLoc.lat, onlineLoc.lng, table.tenant_id, orderResult.insertId]
+                    );
+                } catch {}
+            }
             for (const it of cleanItems) {
                 await connection.execute(
                     `INSERT INTO pos_order_items (tenant_id, order_id, product_id, item_name, item_category, item_image, quantity, unit_price, line_total)
@@ -310,13 +349,15 @@ router.post('/order/:code', async (req, res) => {
                     [table.tenant_id, orderResult.insertId, it.id, it.name, it.category, it.image, it.qty, it.price, it.price * it.qty]
                 );
             }
-            try {
-                await connection.execute(`UPDATE pos_tables SET status='CUSTOMER_ORDERED', current_order_code=? WHERE tenant_id=? AND id=?`, [orderCode, table.tenant_id, table.id]);
-            } catch (e) {
-                // Delta_009 not applied yet: fall back to OCCUPIED.
-                if (e && (e.code === 'ER_TRUNCATED_WRONG_VALUE_FOR_FIELD' || (e.message || '').includes('CUSTOMER_ORDERED'))) {
-                    await connection.execute(`UPDATE pos_tables SET status='OCCUPIED', current_order_code=? WHERE tenant_id=? AND id=?`, [orderCode, table.tenant_id, table.id]);
-                } else { throw e; }
+            if (!onlineMode) {
+                try {
+                    await connection.execute(`UPDATE pos_tables SET status='CUSTOMER_ORDERED', current_order_code=? WHERE tenant_id=? AND id=?`, [orderCode, table.tenant_id, table.id]);
+                } catch (e) {
+                    // Delta_009 not applied yet: fall back to OCCUPIED.
+                    if (e && (e.code === 'ER_TRUNCATED_WRONG_VALUE_FOR_FIELD' || (e.message || '').includes('CUSTOMER_ORDERED'))) {
+                        await connection.execute(`UPDATE pos_tables SET status='OCCUPIED', current_order_code=? WHERE tenant_id=? AND id=?`, [orderCode, table.tenant_id, table.id]);
+                    } else { throw e; }
+                }
             }
             await connection.commit();
             connection.release();
@@ -326,7 +367,7 @@ router.post('/order/:code', async (req, res) => {
             throw e;
         }
 
-        res.status(201).json({ success: true, data: { orderCode, tableNo: table.table_no, total: subtotal } });
+        res.status(201).json({ success: true, data: { orderCode, tableNo: table.table_no, total: subtotal, isOnline: onlineMode } });
     } catch (e) {
         console.error('Public table order error:', e);
         res.status(500).json({ success: false, message: 'Could not place order' });
