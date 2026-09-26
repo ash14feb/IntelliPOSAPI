@@ -22,6 +22,7 @@ const posExpensesRoutes = require('./api/posexpenses');
 const exportRoutes = require('./api/export');
 const reviewsRoutes = require('./api/reviews');
 const subscriptionRoutes = require('./api/subscription');
+const upsellRoutes = require('./api/upsell');
 const app = express();
 
 // Middleware
@@ -61,6 +62,7 @@ app.use('/api/posexpenses', posExpensesRoutes);
 app.use('/api/export', exportRoutes);
 app.use('/api/reviews', reviewsRoutes);
 app.use('/api/subscription', subscriptionRoutes);
+app.use('/api/upsell', upsellRoutes);
 
 // 404 handler
 app.use('*', (req, res) => {

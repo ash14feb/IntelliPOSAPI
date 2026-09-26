@@ -136,6 +136,7 @@ router.get('/menu/:code', async (req, res) => {
                 tableStatus: table.status,
                 activeOrder: await getPublicActiveOrder(table),
                 recommended,
+                upsells: await require('./upsell').getApprovedUpsellMap(table.tenant_id),
                 menuItems: items.map(r => ({
                     id: String(r.id),
                     name: r.name,
