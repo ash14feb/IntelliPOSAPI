@@ -274,10 +274,14 @@ router.get('/stats', authorize(...OWNER_ROLES), async (req, res) => {
     }
 });
 
-// Generate (bulk). New rows are DRAFT; APPROVED rows untouched.
+// Generate (bulk, or scoped to selected source items via { source_item_ids: [...] }).
+// New rows are DRAFT; APPROVED rows untouched.
 router.post('/generate', authorize(...OWNER_ROLES), async (req, res) => {
     try {
-        const out = await generateFor(req.user.tenant_id, null);
+        const ids = Array.isArray(req.body?.source_item_ids)
+            ? req.body.source_item_ids.map(Number).filter(Boolean)
+            : null;
+        const out = await generateFor(req.user.tenant_id, ids && ids.length ? ids : null);
         res.json({ success: true, data: out, message: `Generated ${out.saved} recommendations (${out.sources} items) as drafts` });
     } catch (e) {
         if (e.code === 'NO_API_KEY') return res.status(500).json({ success: false, message: 'AI is not configured. Set OPENAI_API_KEY on the server.' });
