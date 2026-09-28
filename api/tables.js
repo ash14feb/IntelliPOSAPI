@@ -374,6 +374,67 @@ router.post('/order/:code', async (req, res) => {
     }
 });
 
+// ---- Public online-order status lookup by phone (no auth) ----
+// GET /online-order/status/:code?phone=... — latest ONLINE order for this
+// phone at this table. Lets a refreshed/returning customer see their order
+// without being able to modify it.
+router.get('/online-order/status/:code', async (req, res) => {
+    try {
+        if (!(await ensureMenuCodeColumn())) {
+            return res.status(500).json({ success: false, message: 'Table menu links are not set up yet' });
+        }
+        const tables = await db.query(
+            'SELECT id, tenant_id, table_no FROM pos_tables WHERE menu_code = ? AND is_active = 1 LIMIT 1',
+            [req.params.code]
+        );
+        if (!tables.length) return res.status(404).json({ success: false, message: 'Table link not found' });
+        const table = tables[0];
+        if (!isOnlineTable(table)) return res.status(400).json({ success: false, message: 'Not an online ordering link' });
+        const phone = String(req.query.phone || '').trim();
+        if (!phone) return res.status(400).json({ success: false, message: 'Phone number is required' });
+        const orows = await db.query(
+            `SELECT id, order_code, subtotal, total_amount, customer_name, customer_phone, customer_address, customer_landmark, kitchen_notes, order_status, created_at
+             FROM pos_orders
+             WHERE tenant_id = ? AND table_id = ? AND order_type = 'ONLINE' AND customer_phone = ?
+             ORDER BY created_at DESC LIMIT 1`,
+            [table.tenant_id, table.id, phone]
+        );
+        if (!orows.length) return res.json({ success: true, data: { order: null } });
+        const o = orows[0];
+        const irows = await db.query(
+            `SELECT item_name, quantity, unit_price, line_total FROM pos_order_items WHERE tenant_id = ? AND order_id = ? ORDER BY id ASC`,
+            [table.tenant_id, o.id]
+        );
+        res.json({
+            success: true,
+            data: {
+                order: {
+                    orderCode: o.order_code,
+                    orderStatus: o.order_status,
+                    customerName: o.customer_name || '',
+                    customerPhone: o.customer_phone || '',
+                    address: o.customer_address || '',
+                    landmark: o.customer_landmark || '',
+                    kitchenNotes: o.kitchen_notes || '',
+                    subtotal: Number(o.subtotal || 0),
+                    total: Number(o.total_amount ?? o.subtotal ?? 0),
+                    createdAt: o.created_at,
+                    locked: !['COMPLETED', 'PAID', 'CANCELLED', 'REJECTED'].includes(String(o.order_status || '').toUpperCase()),
+                    items: irows.map((r) => ({
+                        name: r.item_name,
+                        qty: Number(r.quantity || 0),
+                        price: Number(r.unit_price || 0),
+                        lineTotal: Number(r.line_total ?? (Number(r.unit_price || 0) * Number(r.quantity || 0))),
+                    })),
+                }
+            }
+        });
+    } catch (e) {
+        console.error('Online order status error:', e);
+        res.status(500).json({ success: false, message: 'Could not load order status' });
+    }
+});
+
 // ---- Public rating/review submit from a table QR menu (no auth) ----
 // Body: { overallRating (1-5, required), reviewText (max 250), itemRatings: [{name, rating}] }
 // Allowed only while the table is HAVING_FOOD with a live order. One review per
@@ -456,6 +517,19 @@ router.get('/', async (req,res)=>{
                 }
             }
         }
+        // occupied_since: when the current order started (for live timers).
+        try {
+            const codes = r.filter((t) => t.current_order_code).map((t) => t.current_order_code);
+            if (codes.length) {
+                const ph = codes.map(() => '?').join(',');
+                const orows = await db.query(
+                    `SELECT order_code, created_at FROM pos_orders WHERE tenant_id = ? AND order_code IN (${ph})`,
+                    [req.user.tenant_id, ...codes]
+                );
+                const m = new Map(orows.map((o) => [o.order_code, o.created_at]));
+                for (const t of r) t.occupied_since = m.get(t.current_order_code) || null;
+            }
+        } catch { /* timers optional */ }
         res.json({success:true,data:r});
     } catch(e){ res.status(500).json({success:false,message:'Error fetching tables'}); }
 });
