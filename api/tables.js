@@ -393,40 +393,60 @@ router.get('/online-order/status/:code', async (req, res) => {
         const phone = String(req.query.phone || '').trim();
         if (!phone) return res.status(400).json({ success: false, message: 'Phone number is required' });
         const orows = await db.query(
-            `SELECT id, order_code, subtotal, total_amount, customer_name, customer_phone, customer_address, customer_landmark, kitchen_notes, order_status, created_at
+            `SELECT id, order_code, subtotal, total_amount, payment_mode, customer_name, customer_phone, customer_address, customer_landmark, kitchen_notes, order_status, created_at
              FROM pos_orders
              WHERE tenant_id = ? AND table_id = ? AND order_type = 'ONLINE' AND customer_phone = ?
-             ORDER BY created_at DESC LIMIT 1`,
+             ORDER BY created_at DESC LIMIT 10`,
             [table.tenant_id, table.id, phone]
         );
-        if (!orows.length) return res.json({ success: true, data: { order: null } });
-        const o = orows[0];
-        const irows = await db.query(
-            `SELECT item_name, quantity, unit_price, line_total FROM pos_order_items WHERE tenant_id = ? AND order_id = ? ORDER BY id ASC`,
-            [table.tenant_id, o.id]
-        );
+        if (!orows.length) return res.json({ success: true, data: { order: null, history: [] } });
+        const FINAL = ['COMPLETED', 'PAID', 'CANCELLED', 'REJECTED'];
+        const mapOrder = (o, items) => ({
+            orderCode: o.order_code,
+            orderStatus: o.order_status,
+            paymentMode: o.payment_mode || '',
+            paymentPending: !['PAID', 'COMPLETED'].includes(String(o.order_status || '').toUpperCase()),
+            customerName: o.customer_name || '',
+            customerPhone: o.customer_phone || '',
+            address: o.customer_address || '',
+            landmark: o.customer_landmark || '',
+            kitchenNotes: o.kitchen_notes || '',
+            subtotal: Number(o.subtotal || 0),
+            total: Number(o.total_amount ?? o.subtotal ?? 0),
+            createdAt: o.created_at,
+            locked: !FINAL.includes(String(o.order_status || '').toUpperCase()),
+            items,
+        });
+        const withItems = [];
+        for (const o of orows) {
+            const irows = await db.query(
+                `SELECT item_name, quantity, unit_price, line_total FROM pos_order_items WHERE tenant_id = ? AND order_id = ? ORDER BY id ASC`,
+                [table.tenant_id, o.id]
+            );
+            withItems.push(mapOrder(o, irows.map((r) => ({
+                name: r.item_name,
+                qty: Number(r.quantity || 0),
+                price: Number(r.unit_price || 0),
+                lineTotal: Number(r.line_total ?? (Number(r.unit_price || 0) * Number(r.quantity || 0))),
+            }))));
+        }
+        // Existing review flags for past (final) orders.
+        try {
+            const codes = withItems.map((o) => o.orderCode);
+            const ph = codes.map(() => '?').join(',');
+            const rrows = await db.query(
+                `SELECT order_code, overall_rating FROM pos_reviews WHERE tenant_id = ? AND order_code IN (${ph})`,
+                [table.tenant_id, ...codes]
+            );
+            const rated = new Map(rrows.map((r) => [r.order_code, Number(r.overall_rating || 0)]));
+            for (const o of withItems) o.userRating = rated.get(o.orderCode) || 0;
+        } catch {}
+        const live = withItems.find((o) => o.locked) || null;
         res.json({
             success: true,
             data: {
-                order: {
-                    orderCode: o.order_code,
-                    orderStatus: o.order_status,
-                    customerName: o.customer_name || '',
-                    customerPhone: o.customer_phone || '',
-                    address: o.customer_address || '',
-                    landmark: o.customer_landmark || '',
-                    kitchenNotes: o.kitchen_notes || '',
-                    subtotal: Number(o.subtotal || 0),
-                    total: Number(o.total_amount ?? o.subtotal ?? 0),
-                    createdAt: o.created_at,
-                    locked: !['COMPLETED', 'PAID', 'CANCELLED', 'REJECTED'].includes(String(o.order_status || '').toUpperCase()),
-                    items: irows.map((r) => ({
-                        name: r.item_name,
-                        qty: Number(r.quantity || 0),
-                        price: Number(r.unit_price || 0),
-                        lineTotal: Number(r.line_total ?? (Number(r.unit_price || 0) * Number(r.quantity || 0))),
-                    })),
-                }
+                order: live,
+                history: withItems.filter((o) => !o.locked),
             }
         });
     } catch (e) {
@@ -441,7 +461,7 @@ router.get('/online-order/status/:code', async (req, res) => {
 // order — resubmitting updates the previous review.
 router.post('/review/:code', async (req, res) => {
     try {
-        const { overallRating, reviewText, itemRatings } = req.body || {};
+        const { overallRating, reviewText, itemRatings, orderCode: bodyOrderCode } = req.body || {};
         const overall = Math.max(1, Math.min(5, Number(overallRating) || 0));
         if (!overall) return res.status(400).json({ success: false, message: 'Please give an overall rating' });
         const text = reviewText ? String(reviewText).slice(0, 250) : '';
@@ -451,10 +471,26 @@ router.post('/review/:code', async (req, res) => {
         );
         if (!tables.length) return res.status(404).json({ success: false, message: 'Table link not found' });
         const table = tables[0];
-        if (String(table.status || '').toUpperCase() !== 'HAVING_FOOD' || !table.current_order_code) {
-            return res.status(400).json({ success: false, message: 'Reviews open after your food is served' });
+        let orderCodeToRate;
+        if (isOnlineTable(table) && bodyOrderCode) {
+            // Online: rate any of your own PAID/COMPLETED delivery orders.
+            const orows = await db.query(
+                `SELECT id, order_code, customer_name, customer_phone, order_status FROM pos_orders
+                 WHERE tenant_id = ? AND table_id = ? AND order_type = 'ONLINE' AND order_code = ? LIMIT 1`,
+                [table.tenant_id, table.id, String(bodyOrderCode)]
+            );
+            if (!orows.length) return res.status(400).json({ success: false, message: 'Order not found' });
+            if (!['PAID', 'COMPLETED'].includes(String(orows[0].order_status || '').toUpperCase())) {
+                return res.status(400).json({ success: false, message: 'You can rate this order once it is completed' });
+            }
+            orderCodeToRate = orows[0].order_code;
+        } else {
+            if (String(table.status || '').toUpperCase() !== 'HAVING_FOOD' || !table.current_order_code) {
+                return res.status(400).json({ success: false, message: 'Reviews open after your food is served' });
+            }
+            orderCodeToRate = table.current_order_code;
         }
-        const orows = await db.query(`SELECT id, customer_name, customer_phone FROM pos_orders WHERE tenant_id=? AND order_code=? LIMIT 1`, [table.tenant_id, table.current_order_code]);
+        const orows = await db.query(`SELECT id, customer_name, customer_phone FROM pos_orders WHERE tenant_id=? AND order_code=? LIMIT 1`, [table.tenant_id, orderCodeToRate]);
         if (!orows.length) return res.status(400).json({ success: false, message: 'Order not found' });
         const ord = orows[0];
         const cleanItems = Array.isArray(itemRatings)
@@ -466,7 +502,7 @@ router.post('/review/:code', async (req, res) => {
         const connection = await db.getConnection();
         try {
             await connection.beginTransaction();
-            const existing = await connection.execute(`SELECT id FROM pos_reviews WHERE tenant_id=? AND order_code=? LIMIT 1`, [table.tenant_id, table.current_order_code]);
+            const existing = await connection.execute(`SELECT id FROM pos_reviews WHERE tenant_id=? AND order_code=? LIMIT 1`, [table.tenant_id, orderCodeToRate]);
             let reviewId = existing[0] && existing[0][0] ? existing[0][0].id : null;
             if (reviewId) {
                 await connection.execute(`UPDATE pos_reviews SET overall_rating=?, review_text=?, customer_name=?, customer_phone=? WHERE tenant_id=? AND id=?`, [overall, text || null, ord.customer_name || null, ord.customer_phone || null, table.tenant_id, reviewId]);
@@ -474,7 +510,7 @@ router.post('/review/:code', async (req, res) => {
             } else {
                 const [result] = await connection.execute(
                     `INSERT INTO pos_reviews (tenant_id, order_id, order_code, table_id, customer_name, customer_phone, overall_rating, review_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-                    [table.tenant_id, ord.id, table.current_order_code, table.id, ord.customer_name || null, ord.customer_phone || null, overall, text || null]
+                    [table.tenant_id, ord.id, orderCodeToRate, table.id, ord.customer_name || null, ord.customer_phone || null, overall, text || null]
                 );
                 reviewId = result.insertId;
             }
