@@ -34,7 +34,16 @@ router.get("/", async (req,res)=>{
 router.put("/:code/status", async (req,res)=>{
   try{
     const status = String(req.body.status || '').toUpperCase();
-    await db.query("UPDATE pos_orders SET order_status=? WHERE tenant_id=? AND order_code=?",[status,req.user.tenant_id,req.params.code]);
+    // Optional payment capture (online "payment received" flow).
+    const payMode = req.body.payment_mode ? String(req.body.payment_mode).toUpperCase() : null;
+    if (payMode && !['CASH', 'UPI', 'CARD', 'PENDING'].includes(payMode)) {
+      return res.status(400).json({ success: false, message: 'Invalid payment_mode' });
+    }
+    if (payMode) {
+      await db.query("UPDATE pos_orders SET order_status=?, payment_mode=? WHERE tenant_id=? AND order_code=?",[status, payMode, req.user.tenant_id,req.params.code]);
+    } else {
+      await db.query("UPDATE pos_orders SET order_status=? WHERE tenant_id=? AND order_code=?",[status,req.user.tenant_id,req.params.code]);
+    }
     try {
       const rows = await db.query("SELECT table_id FROM pos_orders WHERE tenant_id=? AND order_code=? LIMIT 1", [req.user.tenant_id, req.params.code]);
       const tid = rows[0]?.table_id;
