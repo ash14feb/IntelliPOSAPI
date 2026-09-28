@@ -1202,6 +1202,17 @@ router.post('/orders', async (req, res) => {
             }
         } catch {}
 
+        // Auto-record customer (best effort, outside the transaction).
+        try {
+            const { recordCustomerFromOrder } = require('../utils/customerSync');
+            recordCustomerFromOrder(tenantId, {
+                name: customerName,
+                phone: customerPhone,
+                amount: Number(total || 0),
+                orderType: safeOrderType,
+            });
+        } catch {}
+
         res.status(201).json({
             success: true,
             message: 'Order saved successfully'

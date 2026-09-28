@@ -367,6 +367,17 @@ router.post('/order/:code', async (req, res) => {
             throw e;
         }
 
+        // Auto-record customer (best effort; new orders only, not appends).
+        try {
+            const { recordCustomerFromOrder } = require('../utils/customerSync');
+            recordCustomerFromOrder(table.tenant_id, {
+                name: customerName,
+                phone: customerPhone,
+                amount: subtotal,
+                orderType: onlineMode ? 'ONLINE' : 'DINEIN',
+            });
+        } catch {}
+
         res.status(201).json({ success: true, data: { orderCode, tableNo: table.table_no, total: subtotal, isOnline: onlineMode } });
     } catch (e) {
         console.error('Public table order error:', e);
