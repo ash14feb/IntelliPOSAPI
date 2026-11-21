@@ -32,8 +32,33 @@ class Dbarcade {
         }
     }
 
+    async transaction(statements = []) {
+        try {
+            const response = await fetch(`${this.baseUrl}/api/transaction`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-api-key': this.apiKey,
+                    'x-db-name': this.dbName
+                },
+                body: JSON.stringify({ statements })
+            });
+
+            const payload = await response.json();
+
+            if (!response.ok) {
+                throw new Error(payload.error || `Bridge transaction failed with ${response.status}`);
+            }
+
+            return payload.data;
+        } catch (error) {
+            console.error('Database transaction error:', error);
+            throw error;
+        }
+    }
+
     async getConnection() {
-        throw new Error('Direct pool connections are handled by the OCI bridge; use db.query(sql, params) instead.');
+        throw new Error('Direct pool connections are handled by the OCI bridge; use db.query(sql, params) or db.transaction(statements) instead.');
     }
 }
 
