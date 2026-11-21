@@ -2,7 +2,7 @@ class Dbarcade {
     constructor() {
         this.baseUrl = process.env.OCI_API_URL || 'https://db.unifylead.com';
         this.apiKey = process.env.OCI_API_KEY;
-        this.dbName = process.env.DB_NAME || 'ScanexPOS';
+        this.dbName = process.env.DB_NAME || 'sparkpos';
 
         console.log(this.dbName);
     }
